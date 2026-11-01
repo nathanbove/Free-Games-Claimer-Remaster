@@ -10,6 +10,7 @@ from datetime import date
 from src.stores.humble import (
     choose_identifiers,
     choose_outcome,
+    payload_snippet,
     extract_tpks,
     is_choice_order,
     membership_slug,
@@ -143,13 +144,32 @@ class TestRevealOutcome:
 
 
 class TestChooseOutcome:
-    def test_success_or_already_chosen_counts(self):
+    def test_success_counts(self):
         assert choose_outcome(200, {"success": True}) is True
-        assert choose_outcome(200, {"success": False, "error": "Content already chosen"}) is True
+
+    def test_wording_alone_does_not(self):
+        # An error echoing the request's own words is not a confirmation:
+        # reading one as success once left a game "chosen" in the log
+        # while Humble created no key entry for it.
+        assert choose_outcome(200, {"success": False, "error": "Content already chosen"}) is False
+        assert choose_outcome(200, {"success": False, "chosen_identifiers": ["x"]}) is False
 
     def test_a_plain_refusal_does_not(self):
         assert choose_outcome(403, {}) is False
         assert choose_outcome(200, {"success": False}) is False
+
+
+class TestPayloadSnippet:
+    def test_a_revealed_key_is_masked(self):
+        snippet = payload_snippet({"success": True, "key": "ABCDE-FGHIJ-KLMNO"})
+        assert "ABCDE" not in snippet
+        assert '"success": true' in snippet
+
+    def test_error_text_survives(self):
+        assert "already redeemed" in payload_snippet({"errors": ["Key already redeemed"]})
+
+    def test_no_body(self):
+        assert payload_snippet(None) == "(no JSON body)"
 
 
 class TestMonthSlugs:
