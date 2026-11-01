@@ -31,6 +31,36 @@ def is_gog_code(code: str, extra: str | None) -> bool:
     return shaped and tag in ("", "unknown")
 
 
+def library_titles(payload: object) -> set:
+    """Normalized titles from one page of your GOG library's own listing.
+
+    The account page's getFilteredProducts answer carries a products list;
+    anything shaped differently reads as an empty page, never as an error.
+    """
+    titles = set()
+    if not isinstance(payload, dict):
+        return titles
+    for product in payload.get("products") or []:
+        if isinstance(product, dict) and product.get("title"):
+            titles.add(BaseClaimer._normalize_title(str(product["title"])))
+    return titles
+
+
+def extra_key_posted(extra: str | None) -> bool:
+    """True when a code's row remembers its spare key was already posted."""
+    try:
+        return bool(json.loads(extra or "{}").get("extra_key_posted"))
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def divertable(title: str, extra: str | None, owned_titles) -> bool:
+    """A pending code is a spare when its game is owned and it was not posted yet."""
+    if not owned_titles:
+        return False
+    return BaseClaimer._normalize_title(title or "") in owned_titles and not extra_key_posted(extra)
+
+
 def gog_redeem_outcome(texts: dict) -> str:
     """What GOG's redeem page says: locked, already, success or unknown, from its heading, message, main part and page."""
     h1, msg, body, page = (str((texts or {}).get(k) or "").lower() for k in ("h1", "msg", "body", "page"))
@@ -466,6 +496,67 @@ class GOGClaimer(BaseClaimer):
             await self.page.get("https://www.gog.com/en/account/settings/subscriptions")
             await self.sleep(3)
 
+    async def _library_titles(self) -> set | None:
+        """Normalized titles of the games in your GOG library, or None when unread.
+
+        Asked from inside the signed-in page, the way the account page
+        itself asks, paging through the whole library. None when the
+        answer cannot be read: the caller then redeems as usual, and GOG
+        itself refuses a code for a game already owned, leaving it valid.
+        """
+        try:
+            owned: set = set()
+            page = 1
+            while True:
+                raw = await self.page.evaluate(
+                    "(async () => { const r = await fetch("
+                    "'https://www.gog.com/account/getFilteredProducts?mediaType=1&page=%d', "
+                    "{headers: {'Accept': 'application/json'}}); return await r.text(); })()" % page,
+                    await_promise=True)
+                payload = json.loads(raw) if isinstance(raw, str) else None
+                if not isinstance(payload, dict):
+                    return None
+                owned |= library_titles(payload)
+                if page >= int(payload.get("totalPages") or 1):
+                    return owned
+                page += 1
+        except Exception:
+            logger.warning("Your GOG library could not be read, so pending codes are redeemed as usual.")
+            return None
+
+    async def _divert_extra_key(self, g) -> None:
+        """Post one spare GOG code to the duplicates channel instead of redeeming it.
+
+        The row is marked so the code is neither redeemed nor posted
+        twice: its status leaves the pending set, and the row remembers
+        the post for the force-redeem scan, which looks past the status.
+        """
+        from sqlalchemy import select
+
+        from src.core.database import async_session, ClaimedGame
+        from src.core.notifier import markdown_safe, notify_duplicates
+
+        logger.info("'%s' is already in your GOG library; its code goes to the extra keys channel.",
+                    g.title)
+        async with async_session() as session:
+            obj = (await session.execute(
+                select(ClaimedGame).where(ClaimedGame.code == g.code))).scalars().first()
+            if obj:
+                try:
+                    extra = json.loads(obj.extra or "{}")
+                    if not isinstance(extra, dict):
+                        extra = {}
+                except (TypeError, ValueError):
+                    extra = {}
+                extra["extra_key_posted"] = True
+                obj.extra = json.dumps(extra)
+                obj.status = "notified"
+                await session.commit()
+        await notify_duplicates(
+            f"🎁 **{markdown_safe(g.title)}** - spare GOG code "
+            f"(already in your library, from Prime Gaming)\n`{g.code}`")
+        self.notify_games.append({"title": g.title, "url": g.url, "status": "notified"})
+
     async def redeem_pending_codes(self) -> None:
         """Find GOG codes from Prime Gaming that haven't been redeemed yet, and redeem them."""
         from sqlalchemy import select
@@ -520,9 +611,18 @@ class GOGClaimer(BaseClaimer):
                 logger.error("Aborting GOG pending codes redemption due to login failure.")
                 return
             
-            # Redeem each GOG code one by one
+            # Redeem each GOG code one by one - except a spare: when spare
+            # keys have a channel to go to, a code whose game is already in
+            # the library is posted there instead of being redeemed into
+            # the account that owns it.
+            from src.core.notifier import duplicates_enabled
+
+            owned = await self._library_titles() if duplicates_enabled() else None
             for g in gog_games:
-                await self._redeem_gog_code(g.code, g.title, g.url)
+                if owned is not None and divertable(g.title, g.extra, owned):
+                    await self._divert_extra_key(g)
+                else:
+                    await self._redeem_gog_code(g.code, g.title, g.url)
         except Exception:
             logger.exception("Fatal error during pending codes redemption")
         finally:

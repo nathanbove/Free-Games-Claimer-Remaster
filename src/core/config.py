@@ -265,6 +265,9 @@ class Config:
 
     # --- Notifications ---
     discord_webhook: str | None = os.getenv("DISCORD_WEBHOOK")
+    # A second Discord channel that receives spare keys only: keys for games
+    # already in your library, posted as text so they can be given away.
+    discord_webhook_duplicates: str | None = os.getenv("DISCORD_WEBHOOK_DUPLICATES")
     discord_suppress_embeds: bool = _bool("DISCORD_SUPPRESS_EMBEDS", default=True)
     notify_url: str | None = os.getenv("NOTIFY")  # apprise URL fallback
     notify_summary: bool = _bool("NOTIFY_SUMMARY", default=True)

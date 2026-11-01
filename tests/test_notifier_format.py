@@ -6,6 +6,7 @@ before it will render anything. Both are checked here against the real Apprise, 
 a stand-in, because the bug was in what Apprise does with what we hand it.
 """
 
+import asyncio
 from pathlib import Path
 
 import apprise
@@ -344,3 +345,36 @@ class TestALongMessageArrivesInParts:
     def test_discord_uses_the_same_split(self):
         source = (ROOT / "src" / "core" / "notifier.py").read_text(encoding="utf-8")
         assert "split_message(message, DISCORD_MAX)" in source.split("async def send_discord", 1)[1].split("\ndef ", 1)[0]
+
+
+class TestDuplicatesChannel:
+    """A spare key goes to the duplicates channel only, and only when it is set."""
+
+    @pytest.fixture()
+    def sent(self, monkeypatch):
+        import src.core.notifier as notifier
+
+        calls = []
+
+        async def _capture(message, **kwargs):
+            calls.append((message, kwargs))
+
+        monkeypatch.setattr(notifier, "send_discord", _capture)
+        return notifier, calls
+
+    def test_not_configured_means_not_enabled_and_nothing_sent(self, sent, monkeypatch):
+        notifier, calls = sent
+        monkeypatch.setattr(notifier.cfg, "discord_webhook_duplicates", None)
+        assert notifier.duplicates_enabled() is False
+        asyncio.run(notifier.notify_duplicates("a spare key"))
+        assert calls == []
+
+    def test_a_spare_key_goes_to_the_duplicates_webhook_only(self, sent, monkeypatch):
+        notifier, calls = sent
+        monkeypatch.setattr(notifier.cfg, "discord_webhook", "https://example.invalid/main")
+        monkeypatch.setattr(notifier.cfg, "discord_webhook_duplicates", "https://example.invalid/dupes")
+        assert notifier.duplicates_enabled() is True
+        asyncio.run(notifier.notify_duplicates("a spare key"))
+        assert len(calls) == 1
+        _message, kwargs = calls[0]
+        assert kwargs["webhook_url"] == "https://example.invalid/dupes"

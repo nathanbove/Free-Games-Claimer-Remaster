@@ -320,3 +320,49 @@ class TestUnchosenTpks:
         assert tpk["steam_app_id"] == 2321470
         assert tpk["unchosen"] is True
         assert tpk_state(tpk) == "waiting"
+
+
+class TestDuplicateReveal:
+    """A duplicate is revealed and posted as a spare, never queued for your own Steam."""
+
+    def _run_reveal(self, monkeypatch, duplicate):
+        import asyncio
+
+        import src.core.notifier as notifier
+        from src.stores.humble import HumbleClaimer
+
+        claimer = HumbleClaimer()
+        remembered = []
+        posts = []
+
+        async def fake_fetch(url, form=None):
+            return 200, {"success": True, "key": "AAAAA-BBBBB-CCCCC"}
+
+        async def fake_remember(tpk, status, key=None, platform=None, overwrite=True):
+            remembered.append((status, key, platform))
+
+        async def fake_post(message):
+            posts.append(message)
+
+        claimer._fetch = fake_fetch
+        claimer._remember = fake_remember
+        monkeypatch.setattr(notifier, "notify_duplicates", fake_post)
+        tpk = extract_tpks(_order(tpks=[_tpk()]))[0]
+        if duplicate:
+            tpk["duplicate"] = True
+        outcome = asyncio.run(claimer._reveal(tpk))
+        return claimer, remembered, posts, outcome
+
+    def test_a_duplicate_is_saved_as_an_extra_key_and_posted(self, monkeypatch):
+        claimer, remembered, posts, outcome = self._run_reveal(monkeypatch, duplicate=True)
+        assert outcome == "claimed"
+        assert remembered == [("notified", "AAAAA-BBBBB-CCCCC", "extra-key")]
+        assert claimer.notify_games[0]["status"] == "notified"
+        assert len(posts) == 1 and "AAAAA-BBBBB-CCCCC" in posts[0]
+
+    def test_an_ordinary_key_is_claimed_for_yourself_and_not_posted(self, monkeypatch):
+        claimer, remembered, posts, outcome = self._run_reveal(monkeypatch, duplicate=False)
+        assert outcome == "claimed"
+        assert remembered == [("claimed", "AAAAA-BBBBB-CCCCC", "steam")]
+        assert claimer.notify_games[0]["status"] == "claimed"
+        assert posts == []

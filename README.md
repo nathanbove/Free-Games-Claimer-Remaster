@@ -92,6 +92,7 @@ AE_PASSWORD=your_password
 
 # Notifications
 DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+DISCORD_WEBHOOK_DUPLICATES=https://discord.com/api/webhooks/...
 
 # Run only specific stores (comma-separated)
 # Leave commented to run the defaults (everything except fab, unity and the sites
@@ -176,7 +177,7 @@ Options are set via environment variables in `.env`:
 | `HB_EMAIL` | | Humble Bundle login email. |
 | `HB_PASSWORD` | | Humble Bundle login password. |
 | `HB_OTP_KEY` | | Humble Bundle authenticator (TOTP) secret, auto-filled. A code Humble e-mails you (its Guard check) is entered manually via VNC. |
-| `HB_CHECK_STEAM` | `true` | Before revealing a Steam key, check your Steam library (your Steam sign-in, on Steam's own browser profile) and leave the key unrevealed when you already own the game there, so it stays giftable. When the library cannot be read, no Steam key is revealed that run. Set to `false` to reveal every key as before. |
+| `HB_CHECK_STEAM` | `true` | Before revealing a Steam key, check your Steam library (your Steam sign-in, on Steam's own browser profile) and leave the key unrevealed when you already own the game there, so it stays giftable. With `DISCORD_WEBHOOK_DUPLICATES` set, a duplicate is instead revealed and its key posted there as a spare. When the library cannot be read, no Steam key is revealed that run. Set to `false` to reveal every key as before. |
 | `MS_EMAIL` | | Microsoft account email. |
 | `MS_PASSWORD` | | Microsoft account password. |
 | `MS_FORCE_REDEEM` | `false` | Force another pass over Microsoft codes from the last 60 days. |
@@ -219,6 +220,7 @@ Options are set via environment variables in `.env`:
 | `DEBUG_SCREENSHOTS` | `false` | Send each screenshot the bot takes when something fails (also kept in `data/screenshots/`) with a notification, to Discord and to Apprise services that take attachments. A screenshot can show your account name, e-mail or a game code, so send it only to a channel that is yours alone. |
 | `DRYRUN`| `false` | Simulate a run without claiming games. Detects available giveaways and sends a summary report. |
 | `DISCORD_WEBHOOK` | | Discord webhook URL for notifications. |
+| `DISCORD_WEBHOOK_DUPLICATES` | | A second Discord webhook that receives spare keys only: a key for a game already in your library (a Humble Choice game you own on Steam, a Prime Gaming code for a GOG game you own) is posted there as text instead of being redeemed into your account. While unset, spare keys keep the older treatment described for each store. |
 | `DISCORD_SUPPRESS_EMBEDS` | `true` | Show the links in Discord notifications without preview cards, so a summary with many games stays short. `false` brings the cards back. |
 | `NOTIFY` | | Apprise URL(s) for Telegram, Slack, ntfy, etc. Multiple services can be separated by commas. |
 | `NOTIFY_TEST` | `false` | Send a test notification on startup to verify your setup works. |
@@ -310,7 +312,7 @@ What it does on a run:
 - Finds the month to work on from its **membership page**: the page carries the month's games and, for the signed-in reader, names their order for the month. The run reads the current month's page first (stepping back a month at a time when a month is not yours: skipped, or not billed yet) and opens the one order the page names, to read the state of its keys. Only when no recent page names an order does it fall back to the order list, opening orders from the head of the list until the newest Choice month turns up. **It never unlocks a month early**: early unlock is a payment, and a subscriber's month appears as an order on its own when the automatic billing runs on the last Tuesday of the month.
 - Reads the month's lineup from its membership page, because the order has no key entry — no trace at all — for a game you have not selected on the site yet. Lineup games without an entry are accounted for like any other game in the month: the Steam check below covers them, and one already in your library is never even chosen, so no key entry is created for it. When the lineup cannot be read, the run says so rather than sounding complete.
 - Reveals every key that is still unrevealed and unexpired, and saves it in the database, tagged with the store it belongs to. Add `steam` to the same `STORES` and a revealed Steam key is activated on your Steam account at the end of the run, like a Fanatical key; add `gog` and a GOG key is redeemed the same way. Any other key waits in the database and on your [Humble keys page](https://www.humblebundle.com/home/keys), where a revealed key sits anyway.
-- Before revealing a **Steam** key, it checks your Steam library first (`HB_CHECK_STEAM`, on by default), using your Steam sign-in on Steam's own browser profile: a game you already own on Steam keeps its key **unrevealed**, so the key stays giftable and the month refundable. If your library cannot be read at all that run, no Steam key is revealed either; the keys wait for a run that can check. Switch the check off with `HB_CHECK_STEAM=false`.
+- Before revealing a **Steam** key, it checks your Steam library first (`HB_CHECK_STEAM`, on by default), using your Steam sign-in on Steam's own browser profile: a game you already own on Steam keeps its key **unrevealed**, so the key stays giftable and the month refundable. With `DISCORD_WEBHOOK_DUPLICATES` set, a duplicate is instead revealed like any other game and its key is posted to that channel as a spare, tagged so it is never activated on your own account. If your library cannot be read at all that run, no Steam key is revealed either; the keys wait for a run that can check. Switch the check off with `HB_CHECK_STEAM=false`.
 - A game offered as a Steam key or an Epic grant is claimed as the **Steam key**: a key can still be activated or gifted later, a keyless grant cannot be taken back.
 
 What it leaves alone, on purpose:
@@ -387,7 +389,7 @@ docker compose start
 To skip a store, simply exclude it from the `STORES` list. Any unrecognized settings are now reported at startup rather than being ignored silently.
 
 > [!NOTE]
-> **What happens in one run, in order.** GamerPower is asked first, once, and only when this run has a store that can use the answer. Then each big store runs: it claims what it finds itself and, at the end of the same browser session, the giveaways GamerPower found for it. Then any GOG and Microsoft keys waiting from Prime Gaming are redeemed, each only when its store is in this run, and Legacy Games codes when `legacy` is in this run and `LG_EMAIL` and `LG_PASSWORD` are set. Then come the sites with no module of their own (Itch.io, Fanatical, IndieGala, Alienware Arena), all in one browser window. Last, any Steam key a Fanatical giveaway handed out is activated on your Steam account, when Steam is in this run.
+> **What happens in one run, in order.** GamerPower is asked first, once, and only when this run has a store that can use the answer. Then each big store runs: it claims what it finds itself and, at the end of the same browser session, the giveaways GamerPower found for it. Then any GOG and Microsoft keys waiting from Prime Gaming are redeemed, each only when its store is in this run, and Legacy Games codes when `legacy` is in this run and `LG_EMAIL` and `LG_PASSWORD` are set. (A waiting GOG code whose game is already in your GOG library is not redeemed when `DISCORD_WEBHOOK_DUPLICATES` is set; the code is posted there as a spare instead.) Then come the sites with no module of their own (Itch.io, Fanatical, IndieGala, Alienware Arena), all in one browser window. Last, any Steam key a Fanatical giveaway handed out is activated on your Steam account, when Steam is in this run.
 >
 > So `STORES=steam` also claims the Steam giveaways GamerPower lists, and `STORES=prime` sends GamerPower no request at all, because nothing in that run could use it.
 >
@@ -466,6 +468,7 @@ free-games-claimer-remaster/
 Both Discord and Apprise can be configured simultaneously, notifications are sent to ALL configured services in parallel via async dispatch.
 
 - **Discord**: Set `DISCORD_WEBHOOK` in `.env`.
+- **Spare keys**: Set `DISCORD_WEBHOOK_DUPLICATES` to a second Discord webhook and a key for a game already in your library is posted to that channel as text, and nowhere else - a Humble Choice duplicate, a Prime Gaming code for a GOG game you own. While it is unset, those keys keep the older treatment (a Humble key stays unrevealed; a Prime code is redeemed as usual).
 - **Apprise (Telegram, Slack, Email, ntfy, etc.)**: Set `NOTIFY` in `.env`. You can provide multiple URLs separated by commas (e.g. `NOTIFY=ntfy://topic, tgram://token/id`).
 - **Long summaries**: a summary too long for one message arrives in several, cut between lines: up to 2000 characters each on Discord and 4000 through Apprise, under Telegram's limit.
 - **Fine-Tune Filtering**: Use `NOTIFY_SUMMARY=false`, `NOTIFY_ERRORS=false`, etc., to silence specific notification subsets across all services globally.

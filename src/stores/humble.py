@@ -29,8 +29,9 @@ What a run does, in order:
      cannot see a game that was never selected on the site: it has
      no key entry there yet. Lineup games without an entry join the run as
      waiting games in their own right — the Steam check below covers them
-     too, and one already in your library is never chosen, so no key entry
-     is ever created for it. For every game whose key is still unrevealed
+     too, and one already in your library is held back with the rest (or
+     claimed as a spare key, when those have a channel to go to). For every
+     game whose key is still unrevealed
      and unexpired: ask Humble to choose the month's content (one call per
      month, by the short identifiers the site's own claim button sends),
      then reveal each key with one call per game. Choosing a game that
@@ -48,7 +49,10 @@ What a run does, in order:
 Before step 3, a waiting Steam key is checked against your own Steam
 library (HB_CHECK_STEAM, on unless switched off): a game already on Steam
 keeps its key unrevealed, so the key stays giftable and the month stays
-refundable. The check rides Steam's own browser profile and sign-in, and
+refundable - unless a duplicates channel is configured
+(DISCORD_WEBHOOK_DUPLICATES), in which case the duplicate is revealed
+like any other game in the month and its key is posted to that channel
+as an extra key instead. The check rides Steam's own browser profile and sign-in, and
 reads Steam's own userdata and search suggestions. When your library
 cannot be read at all, no Steam key is revealed that run either: a key
 revealed for a game you already own is the one outcome no later run can
@@ -891,9 +895,27 @@ class HumbleClaimer(BaseClaimer):
         else:
             # A keyless grant (an Epic variant linked to your account) has no key to hand over.
             logger.info("✓ Claimed '%s' (%s, no key: it goes to the linked account).", tpk["title"], platform)
+        if tpk.get("duplicate"):
+            # A spare: the game is already in your library, so the key is
+            # saved as an extra key - tagged away from your own Steam queue,
+            # which would only refuse it - and posted to the duplicates
+            # channel as text, ready to give away.
+            await self._remember(tpk, "notified", key=key or None, platform="extra-key")
+            self.notify_games.append({"title": tpk["title"], "url": URL_KEYS, "status": "notified"})
+            if key:
+                await self._post_duplicate(tpk, key)
+            return "claimed"
         await self._remember(tpk, "claimed", key=key or None, platform=platform)
         self.notify_games.append({"title": tpk["title"], "url": URL_KEYS, "status": "claimed"})
         return "claimed"
+
+    async def _post_duplicate(self, tpk: dict, key: str) -> None:
+        """Post one spare key to the duplicates channel: title, then the key itself."""
+        from src.core.notifier import markdown_safe, notify_duplicates
+
+        await notify_duplicates(
+            f"🎁 **{markdown_safe(tpk['title'])}** - spare Steam key "
+            f"(already in your library, from Humble Choice)\n`{key}`")
 
     async def _steam_owned_titles(self, candidates: list) -> set | None:
         """Normalized titles of waiting Steam keys your Steam library already holds.
@@ -902,7 +924,7 @@ class HumbleClaimer(BaseClaimer):
         Steam's own profile and sign-in. The candidates are every waiting
         key entry the run can see, including games that have no entry in
         the order yet: one of those counts as owned exactly the same, and
-        is then never chosen at all. An empty set when the check is off
+        is treated as a duplicate the same. An empty set when the check is off
         (HB_CHECK_STEAM=false) or no Steam key is waiting; None when the
         check is on but your library could not be read, which the caller
         treats as "reveal no Steam key this run".
@@ -936,7 +958,7 @@ class HumbleClaimer(BaseClaimer):
         owned = {BaseClaimer._normalize_title(title)
                  for title, is_owned in verdicts.items() if is_owned}
         logger.info("Steam library check: %d of %d waiting Steam key(s) already in your "
-                    "library, left unrevealed.", len(owned), len(titles))
+                    "library.", len(owned), len(titles))
         return owned
 
     async def _claim_month(self, order: dict, steam_owned: set | None,
@@ -947,7 +969,8 @@ class HumbleClaimer(BaseClaimer):
         that have no entry yet (unchosen_tpks): a game never selected on
         the site is as much this month's game as any other, and the Steam
         check and the plan treat it the same. One already in your Steam
-        library is never chosen, so no key entry is ever created for it.
+        library is held back from the plan - or, when spare keys have a
+        channel to go to, marked as a duplicate and claimed for it instead.
         """
         tpks = extract_tpks(order)
         if lineup:
@@ -972,16 +995,28 @@ class HumbleClaimer(BaseClaimer):
 
         planned = plan_reveals(tpks)
         if planned and steam_owned is not None:
-            # Already on Steam: the key stays unrevealed, so it can still be gifted.
             held = owned_in_plan(planned, steam_owned)
-            for tpk in held:
-                logger.info("'%s' is already in your Steam library, so its key stays unrevealed.",
-                            tpk["title"])
-                await self._remember(tpk, "skipped:owned-on-steam")
-                self.notify_games.append({"title": tpk["title"], "url": URL_KEYS,
-                                          "status": "skipped:owned-on-steam"})
-            drop = {id(tpk) for tpk in held}
-            planned = [tpk for tpk in planned if id(tpk) not in drop]
+            from src.core.notifier import duplicates_enabled
+
+            if held and duplicates_enabled():
+                # Spare keys have somewhere to go: a duplicate is chosen and
+                # revealed like any other game in the month, and its key is
+                # posted to the duplicates channel (see _reveal) instead of
+                # being activated on the owner's own account.
+                for tpk in held:
+                    tpk["duplicate"] = True
+                    logger.info("'%s' is already in your Steam library; its key will be "
+                                "revealed and posted as an extra key.", tpk["title"])
+            else:
+                # Already on Steam: the key stays unrevealed, so it can still be gifted.
+                for tpk in held:
+                    logger.info("'%s' is already in your Steam library, so its key stays unrevealed.",
+                                tpk["title"])
+                    await self._remember(tpk, "skipped:owned-on-steam")
+                    self.notify_games.append({"title": tpk["title"], "url": URL_KEYS,
+                                              "status": "skipped:owned-on-steam"})
+                drop = {id(tpk) for tpk in held}
+                planned = [tpk for tpk in planned if id(tpk) not in drop]
         elif planned and steam_owned is None and not cfg.dryrun:
             # The library could not be read: no Steam key is revealed on a guess.
             held = [tpk for tpk in planned if (tpk.get("key_type") or "") == "steam"]
@@ -1001,7 +1036,11 @@ class HumbleClaimer(BaseClaimer):
 
         if cfg.dryrun:
             for tpk in planned:
-                logger.info("DRYRUN – skipped revealing '%s'.", tpk["title"])
+                if tpk.get("duplicate"):
+                    logger.info("DRYRUN – skipped revealing '%s' (already in your library: "
+                                "its key would be posted as an extra key).", tpk["title"])
+                else:
+                    logger.info("DRYRUN – skipped revealing '%s'.", tpk["title"])
                 self.notify_games.append({"title": tpk["title"], "url": URL_KEYS, "status": "available (dry run)"})
             return
 
