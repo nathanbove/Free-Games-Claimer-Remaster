@@ -5,25 +5,22 @@ a Choice month is an order whose product is a subscription, and each game in it
 is a third-party key (TPK) that gains a `redeemed_key_val` only once revealed.
 """
 
-from datetime import datetime, timezone
+from datetime import date
 
 from src.stores.humble import (
     choose_identifiers,
     choose_outcome,
-    detail_facts,
     extract_tpks,
-    facts_from_cache,
-    facts_to_cache,
     is_choice_order,
     membership_slug,
     month_lineup,
+    month_slugs,
     order_created,
     owned_in_plan,
-    pick_month,
+    page_gamekey,
     plan_reveals,
     reveal_outcome,
     short_identifier,
-    summary_facts,
     tpk_state,
     unchosen_tpks,
 )
@@ -179,115 +176,41 @@ class TestOwnedInPlan:
         assert owned_in_plan(self._planned(), None) == []
 
 
-class TestSummaryFacts:
-    """The month is picked from the order list alone; this reads one entry."""
+class TestMonthSlugs:
+    """The months a run probes for its month, newest first."""
 
-    def test_a_list_entry_classifies_without_opening_the_order(self):
-        fact = summary_facts(_order())
-        assert fact["gamekey"] == "abc123"
-        assert fact["choice"] is True
-        assert fact["human_name"] == "October 2026 Choice"
-        assert fact["created"] is not None and fact["created"].year == 2026
+    def test_before_the_first_tuesday_the_lineup_is_still_last_months(self):
+        # Sunday 2026-11-01: November's lineup lands Tuesday the 3rd.
+        assert month_slugs(date(2026, 11, 1))[:2] == ["october-2026", "september-2026"]
 
-    def test_a_bundle_entry_is_not_a_choice_month(self):
-        entry = _order(machine="great_games_bundle", category="bundle")
-        entry["product"]["human_name"] = "Great Games Bundle"
-        assert summary_facts(entry)["choice"] is False
+    def test_from_the_first_tuesday_the_new_month_leads(self):
+        assert month_slugs(date(2026, 11, 3))[0] == "november-2026"
+        assert month_slugs(date(2026, 10, 6))[0] == "october-2026"
+        assert month_slugs(date(2026, 10, 5))[0] == "september-2026"
 
-    def test_an_entry_with_no_product_says_nothing(self):
-        fact = summary_facts({"gamekey": "xyz789", "created": "2026-10-06T17:00:00"})
-        assert fact["choice"] is None
-        assert fact["human_name"] == ""
-
-    def test_detail_facts_agree_with_the_summary_shape(self):
-        fact = detail_facts(_order(), "abc123")
-        assert fact["choice"] is True
-        assert fact["created"] is not None
+    def test_stepping_back_crosses_the_year(self):
+        assert month_slugs(date(2027, 1, 1))[:2] == ["december-2026", "november-2026"]
 
 
-class TestPickMonth:
-    """Only the most recent current-plan month is worked on; this picks it."""
+class TestPageGamekey:
+    """A membership page names the signed-in reader's order for the month."""
 
-    def _fact(self, name, created, choice=True):
-        stamp = (datetime.fromisoformat(created).replace(tzinfo=timezone.utc)
-                 if created else None)
-        return {"gamekey": name, "choice": choice, "created": stamp, "human_name": name}
+    def _page(self, gamekey):
+        import json as _json
 
-    def test_the_newest_current_month_wins(self):
-        facts = [self._fact("september", "2026-09-01T17:00:00"),
-                 self._fact("october", "2026-10-06T17:00:00"),
-                 self._fact("august", "2026-08-04T17:00:00")]
-        latest, legacy, older = pick_month(facts)
-        assert latest["human_name"] == "october"
-        assert legacy == []
-        assert older == 2
+        blob = {"contentChoiceData": {"game_data": {
+            "somegame": {"tpkds": [{"machine_name": "somegame_choice_steam",
+                                    "gamekey": gamekey}]},
+        }}}
+        return '<script>var s = {"contentChoiceOptions": ' + _json.dumps(blob) + "};</script>"
 
-    def test_months_before_february_2022_are_legacy(self):
-        facts = [self._fact("december 2021", "2021-12-07T18:00:00"),
-                 self._fact("january 2022", "2022-01-04T18:00:00"),
-                 self._fact("february 2022", "2022-02-01T18:00:00")]
-        latest, legacy, older = pick_month(facts)
-        assert [fact["human_name"] for fact in legacy] == ["december 2021", "january 2022"]
-        assert latest["human_name"] == "february 2022"
-        assert older == 0
+    def test_the_named_order_is_read(self):
+        assert page_gamekey(self._page("abc123")) == "abc123"
 
-    def test_no_current_month_picks_nothing(self):
-        latest, legacy, older = pick_month([self._fact("december 2021", "2021-12-07T18:00:00")])
-        assert latest is None
-        assert len(legacy) == 1
-        assert older == 0
-
-    def test_an_unreadable_date_counts_as_current_but_ranks_oldest(self):
-        facts = [self._fact("mystery", None),
-                 self._fact("january 2023", "2023-01-03T17:00:00")]
-        latest, legacy, older = pick_month(facts)
-        assert legacy == []
-        assert latest["human_name"] == "january 2023"
-        assert older == 1
-
-    def test_non_choice_orders_are_ignored(self):
-        facts = [self._fact("a bundle", "2026-10-01T17:00:00", choice=False),
-                 self._fact("october", "2026-10-06T17:00:00")]
-        latest, legacy, older = pick_month(facts)
-        assert latest["human_name"] == "october"
-        assert legacy == [] and older == 0
-
-
-class TestFactsCache:
-    """Classifications are kept between runs; these are the kept shapes."""
-
-    def _fact(self, name, created, choice=True):
-        stamp = (datetime.fromisoformat(created).replace(tzinfo=timezone.utc)
-                 if created else None)
-        return {"gamekey": name, "choice": choice, "created": stamp, "human_name": name}
-
-    def test_a_round_trip_keeps_the_pick_the_same(self):
-        facts = [self._fact("october", "2026-10-06T17:00:00"),
-                 self._fact("may 2021", "2021-05-04T17:00:00"),
-                 self._fact("a bundle", "2026-10-02T17:00:00", choice=False)]
-        kept = facts_from_cache(facts_to_cache(facts))
-        latest, legacy, older = pick_month(list(kept.values()))
-        assert latest["human_name"] == "october"
-        assert [fact["human_name"] for fact in legacy] == ["may 2021"]
-        assert older == 0
-
-    def test_facts_without_a_verdict_are_not_kept(self):
-        fact = self._fact("mystery", "2026-10-06T17:00:00")
-        fact["choice"] = None
-        assert facts_to_cache([fact]) == {}
-
-    def test_malformed_kept_entries_are_dropped_not_guessed(self):
-        kept = facts_from_cache({
-            "good": {"choice": True, "created": "2026-10-06T17:00:00", "human_name": "October"},
-            "junk": "not a dict",
-            "no verdict": {"created": "2026-10-06T17:00:00"},
-        })
-        assert list(kept) == ["good"]
-
-    def test_a_kept_stamp_that_no_longer_parses_keeps_its_verdict(self):
-        kept = facts_from_cache({"old": {"choice": True, "created": "someday", "human_name": "Old"}})
-        assert kept["old"]["choice"] is True
-        assert kept["old"]["created"] is None
+    def test_a_month_that_is_not_yours_names_none(self):
+        assert page_gamekey(self._page(None)) is None
+        assert page_gamekey("<html>no data</html>") is None
+        assert page_gamekey(None) is None
 
 
 class TestShortIdentifier:
@@ -345,7 +268,7 @@ def _lineup_page():
                      "expiration_date|datetime": "2027-05-04T17:00:00"}]},
                 "deeprockgalactic_survivor": {"title": "Deep Rock Galactic: Survivor", "tpkds": [
                     {"machine_name": "deeprockgalactic_survivor_choice_steam", "key_type": "steam",
-                     "visible": True, "is_expired": False,
+                     "visible": True, "is_expired": False, "steam_app_id": 2321470,
                      "expiration_date|datetime": "2027-05-04T17:00:00"}]},
                 "ignplus_choicecoupon_2025": {"title": "Get One Month of IGN Plus", "tpkds": [
                     {"machine_name": "ignplus_october_choicecoupon_2026", "key_type": "generic",
@@ -370,6 +293,10 @@ class TestMonthLineup:
     def test_another_months_page_is_not_believed(self):
         assert month_lineup(_lineup_page(), "september_2026_choice") is None
 
+    def test_the_storefront_variant_of_the_month_is_believed(self):
+        page = _lineup_page().replace("october_2026_choice", "october_2026_choice_storefront")
+        assert month_lineup(page, "october_2026") is not None
+
     def test_a_page_without_the_data_reads_as_no_lineup(self):
         assert month_lineup("<html>nothing here</html>", "october_2026_choice") is None
         assert month_lineup("", "october_2026_choice") is None
@@ -390,5 +317,6 @@ class TestUnchosenTpks:
         assert tpk["key_type"] == "steam"
         assert tpk["gamekey"] == "abc123"
         assert tpk["identifier"] == "deeprockgalactic_survivor"
+        assert tpk["steam_app_id"] == 2321470
         assert tpk["unchosen"] is True
         assert tpk_state(tpk) == "waiting"
