@@ -175,7 +175,7 @@ FETCH_TEXT_JS = """
     })()
 """
 
-SUGGEST_ROW = re.compile(r'data-ds-appid="(\d+)".*?<span class="match_name">(.*?)</span>', re.S)
+SUGGEST_ROW = re.compile(r'data-ds-appid="(\d+)".*?class="match_name">([^<]*)<', re.S)
 
 # Edition words a title can carry on one store and not the other, for the same game.
 EDITION_SUFFIXES = (
@@ -241,6 +241,39 @@ def title_is_owned(title: str, candidates: list, owned_ids: set) -> bool:
         return False
     return any(app_id in (owned_ids or set()) and _title_forms(name) & forms
                for app_id, name in candidates or [])
+
+
+def owned_verdicts(titles: list, candidates_by_title: dict, owned_ids: set,
+                   app_ids: dict | None = None) -> dict | None:
+    """Per-title owned verdicts, or None when the check can speak for no title.
+
+    A title with a known Steam app id (Humble's own data names it for the
+    month's games) is decided by that id alone: the suggestions exist to
+    find the app a title means, and an answer in hand beats the search.
+    A title the suggestions say nothing about counts as not owned, with
+    one exception: when NO title could be spoken for at all (no app ids,
+    and silence from every search), the reading itself is broken (its
+    page changed shape, most likely), and None sends the caller to its
+    fail-closed path rather than let it hand out verdicts it cannot
+    support.
+    """
+    verdicts = {}
+    spoken = 0
+    for title in titles or []:
+        app_id = (app_ids or {}).get(title)
+        if app_id:
+            spoken += 1
+            verdicts[title] = int(app_id) in (owned_ids or set())
+            continue
+        candidates = (candidates_by_title or {}).get(title) or []
+        if not candidates:
+            verdicts[title] = False
+            continue
+        spoken += 1
+        verdicts[title] = title_is_owned(title, candidates, owned_ids)
+    if titles and not spoken:
+        return None
+    return verdicts
 
 
 class SteamClaimer(BaseClaimer):
@@ -1127,14 +1160,16 @@ class SteamClaimer(BaseClaimer):
         await self.sleep(3)
 
 
-async def steam_owned_verdicts(titles: list[str]) -> dict[str, bool] | None:
+async def steam_owned_verdicts(titles: list[str],
+                               app_ids: dict | None = None) -> dict[str, bool] | None:
     """Which of these titles are already in your Steam library; None when it cannot be read.
 
     One Steam session on Steam's own browser profile (STEAM_USERNAME /
     STEAM_PASSWORD, or the sign-in already saved there), opened and closed
     for the check alone, so a caller in another store can ask before it
     hands out a Steam key it cannot take back. Steam's own userdata names
-    the apps you own; its search suggestions name the app a title means.
+    the apps you own; a title with a known app id is decided by it, and
+    its search suggestions name the app for the titles without one.
     """
     wanted = [t for t in dict.fromkeys(titles or []) if str(t).strip()]
     if not wanted:
@@ -1170,10 +1205,21 @@ async def steam_owned_verdicts(titles: list[str]) -> dict[str, bool] | None:
             logger.warning("Steam's library data answered %s and could not be read.", status)
             return None
 
-        verdicts = {}
+        candidates_by_title = {}
         for title in wanted:
+            if (app_ids or {}).get(title):
+                continue  # The app id decides this one; no search needed.
             _, suggest_html = await _fetch_text(URL_SUGGEST.format(term=quote_plus(str(title))))
-            verdicts[title] = title_is_owned(title, suggest_candidates(suggest_html), owned)
+            candidates_by_title[title] = suggest_candidates(suggest_html)
+        verdicts = owned_verdicts(wanted, candidates_by_title, owned, app_ids)
+        if verdicts is None:
+            logger.warning("Steam's suggestions named no app for any title, so your "
+                           "library cannot be checked this run.")
+            return None
+        for title in wanted:
+            if not (app_ids or {}).get(title) and not candidates_by_title.get(title):
+                logger.warning("Steam's suggestions named no app for '%s' and no app id is "
+                               "known for it, so it is treated as not in your library.", title)
         logger.debug("Steam library check: %d of %d title(s) already owned.",
                      sum(1 for v in verdicts.values() if v), len(verdicts))
         return verdicts

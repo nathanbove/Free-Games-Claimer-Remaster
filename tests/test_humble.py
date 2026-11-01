@@ -345,7 +345,7 @@ def _lineup_page():
                      "expiration_date|datetime": "2027-05-04T17:00:00"}]},
                 "deeprockgalactic_survivor": {"title": "Deep Rock Galactic: Survivor", "tpkds": [
                     {"machine_name": "deeprockgalactic_survivor_choice_steam", "key_type": "steam",
-                     "visible": True, "is_expired": False,
+                     "visible": True, "is_expired": False, "steam_app_id": 2321470,
                      "expiration_date|datetime": "2027-05-04T17:00:00"}]},
                 "ignplus_choicecoupon_2025": {"title": "Get One Month of IGN Plus", "tpkds": [
                     {"machine_name": "ignplus_october_choicecoupon_2026", "key_type": "generic",
@@ -390,5 +390,6 @@ class TestUnchosenTpks:
         assert tpk["key_type"] == "steam"
         assert tpk["gamekey"] == "abc123"
         assert tpk["identifier"] == "deeprockgalactic_survivor"
+        assert tpk["steam_app_id"] == 2321470
         assert tpk["unchosen"] is True
         assert tpk_state(tpk) == "waiting"

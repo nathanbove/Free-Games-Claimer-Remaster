@@ -16,6 +16,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - **`docker-compose.yml` builds locally instead of pulling a published image** – the image now comes from the Dockerfile in the checkout (`image: fgc-remaster:${FGC_TAG:-local}`, `pull_policy: never`), so `docker compose up -d --build` runs the code in front of you, which is what you want when testing a change such as a new store. `FGC_TAG` only names the local image now and no longer selects a published release or the `dev` build; a comment in the compose file shows the published-image line to restore if you want that back. The `.env` file is also no longer required for the container to start, so a fresh checkout comes up and you can sign in over VNC before creating one from `.env.example`.
 
+### Fixed
+- **The Steam-library check reads Steam's suggestions as they are served now, and prefers the app id Humble names** – the suggestion rows carry the game's name in a div where the reading expected a span, so the check parsed silence and called every waiting game unowned: a game already in your library (Deep Rock Galactic: Survivor, in the run that showed this) would have had its Humble key revealed. The reading accepts the name element as served, with the live page shape in the tests, and where the month's own data names a game's Steam app, the check decides by that app id instead of searching at all. A run where no title can be spoken for at all (no app ids, silence from every search) now counts the library as unreadable and reveals no Steam key, rather than trusting a broken reading.
+- **A first Humble run no longer looks hung while it classifies** – classifying opens orders one by one (hundreds on a long-lived account) and said nothing until it finished; it now reports progress every 50 orders. The answers are still kept, so the walk happens once.
+
 ## [1.18] - 2026-10-21
 
 ### Changed

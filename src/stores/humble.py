@@ -296,6 +296,10 @@ def extract_tpks(order: dict) -> list[dict]:
             key_index = int(tpk.get("key_index") or 0)
         except (TypeError, ValueError):
             key_index = 0
+        try:
+            steam_app_id = int(tpk.get("steam_app_id") or 0)
+        except (TypeError, ValueError):
+            steam_app_id = 0
         found.append({
             "gamekey": gamekey,
             "title": str(tpk.get("human_name") or "(untitled)"),
@@ -305,6 +309,7 @@ def extract_tpks(order: dict) -> list[dict]:
             "revealed_key": tpk.get("redeemed_key_val") or None,
             "expired": bool(tpk.get("is_expired")),
             "expiry_date": str(tpk.get("expiry_date") or ""),
+            "steam_app_id": steam_app_id,
         })
     return found
 
@@ -498,6 +503,7 @@ def month_lineup(page: str | None, product_machine: str = "") -> list | None:
                 "key_type": key_type,
                 "expired": bool(tpkd.get("is_expired")),
                 "expiry_date": str(tpkd.get("expiration_date|datetime") or ""),
+                "steam_app_id": tpkd.get("steam_app_id") or 0,
             })
         if not tpks:
             continue
@@ -534,6 +540,7 @@ def unchosen_tpks(order: dict, lineup: list) -> list[dict]:
                 "revealed_key": None,
                 "expired": tpkd["expired"],
                 "expiry_date": tpkd["expiry_date"],
+                "steam_app_id": tpkd.get("steam_app_id") or 0,
                 "identifier": game["identifier"],
                 "unchosen": True,
             })
@@ -758,6 +765,9 @@ class HumbleClaimer(BaseClaimer):
                 opened[gamekey] = order
                 fact = detail_facts(order, gamekey)
                 unclassified += 1
+                if unclassified % 50 == 0:
+                    logger.info("Classifying your orders: %d opened so far, and the answers "
+                                "are kept, so this walk happens once.", unclassified)
             facts_by_key[gamekey] = fact
         facts = list(facts_by_key.values())
         if unclassified:
@@ -922,13 +932,26 @@ class HumbleClaimer(BaseClaimer):
         """
         if not cfg.hb_check_steam:
             return set()
-        titles = sorted({tpk["title"] for tpk in plan_reveals(candidates)
+        planned = plan_reveals(candidates)
+        titles = sorted({tpk["title"] for tpk in planned
                          if (tpk.get("key_type") or "") == "steam"})
         if not titles:
             return set()
+        # The month's page data names each game's Steam app outright; where
+        # it does, the check decides by the app id instead of searching.
+        app_ids = {}
+        for tpk in planned:
+            if (tpk.get("key_type") or "") != "steam":
+                continue
+            try:
+                app_id = int(tpk.get("steam_app_id") or 0)
+            except (TypeError, ValueError):
+                app_id = 0
+            if app_id:
+                app_ids[tpk["title"]] = app_id
         from src.stores.steam import steam_owned_verdicts
 
-        verdicts = await steam_owned_verdicts(titles)
+        verdicts = await steam_owned_verdicts(titles, app_ids)
         if verdicts is None:
             logger.warning("Your Steam library could not be checked, so no Steam key will be "
                            "revealed this run; the keys wait, unrevealed, for the next one.")

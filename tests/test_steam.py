@@ -9,7 +9,7 @@ import pytest
 
 from src.stores.steam import (DEMO_JS, GAMES_ONLY, KEY_OUTCOMES, REMEMBER_ME_JS, REMEMBER_ME_STATE_JS, STORE_FREE_SEARCH,
                               SteamClaimer, activation_outcome, base_game_button_js, claim_order, free_search_games,
-                              is_waiting_steam_key, owned_app_ids, suggest_candidates, title_is_owned)
+                              is_waiting_steam_key, owned_app_ids, owned_verdicts, suggest_candidates, title_is_owned)
 
 SOURCE = (Path(__file__).resolve().parent.parent / "src" / "stores" / "steam.py").read_text(encoding="utf-8")
 
@@ -438,13 +438,26 @@ class TestOnlyRealGiveaways:
 class TestLibraryOwnershipCheck:
     """The userdata / suggest reading Humble's Steam-key guard is built on."""
 
+    # The rows as Steam serves them now (the name in a div), plus one row in
+    # the older span shape, which the reading still accepts.
     SUGGEST = (
-        '<a data-ds-appid="1234" data-ds-itemkey="App_1234" class="match" '
+        '<a class="match ds_collapse_flag " data-ds-appid="1234" data-ds-itemkey="App_1234" '
         'href="https://store.steampowered.com/app/1234/A_Game/">'
-        '<div class="match_details"><span class="match_name">A Game</span></div></a>'
+        '<div class="match_name">A Game</div><div class="match_price">$9.99</div></a>'
         '<a data-ds-appid="5678" data-ds-itemkey="App_5678" class="match" '
         'href="https://store.steampowered.com/app/5678/Fish__Chips/">'
         '<div class="match_details"><span class="match_name">Fish &amp; Chips</span></div></a>'
+    )
+
+    # One game's real suggestions page: the game itself, then its DLC and packs.
+    SUGGEST_SURVIVOR = (
+        '<a class="match ds_collapse_flag "  data-ds-appid="2321470" data-ds-itemkey="App_2321470" '
+        'href="https://store.steampowered.com/app/2321470/Deep_Rock_Galactic_Survivor/">'
+        '<div class="match_name">Deep Rock Galactic: Survivor</div>'
+        '<div class="match_price">$12.99</div></a>'
+        '<a class="match ds_collapse_flag "  data-ds-appid="4395500" data-ds-itemkey="App_4395500" '
+        'href="https://store.steampowered.com/app/4395500/Deep_Rock_Galactic_Survivor_Heavy_Duty_Expansion/">'
+        '<div class="match_name">Deep Rock Galactic: Survivor - Heavy Duty Expansion</div></a>'
     )
 
     def test_owned_ids_read_the_userdata_shape(self):
@@ -475,3 +488,38 @@ class TestLibraryOwnershipCheck:
         # The soundtrack is a different app; owning the game says nothing about it.
         assert title_is_owned("A Game", [(1234, "A Game Soundtrack")], {1234}) is False
         assert title_is_owned("A Game 2", [(1234, "A Game")], {1234}) is False
+
+    def test_the_live_suggestions_shape_reads(self):
+        # Regression: Steam serves the name in a div, not a span; a parser
+        # that only knows the span reads silence and calls every game
+        # unowned. The first candidate is the game itself among its DLC.
+        candidates = suggest_candidates(self.SUGGEST_SURVIVOR)
+        assert candidates[0] == (2321470, "Deep Rock Galactic: Survivor")
+        assert title_is_owned("Deep Rock Galactic: Survivor", candidates, {2321470}) is True
+        assert title_is_owned("Deep Rock Galactic: Survivor", candidates, {548430}) is False
+
+    def test_verdicts_speak_for_every_title_or_none(self):
+        by_title = {"A Game": [(1234, "A Game")], "Other Game": [(9999, "Other Game")]}
+        assert owned_verdicts(["A Game", "Other Game"], by_title, {1234}) == {
+            "A Game": True, "Other Game": False}
+        # Silence about one title (a playtest Steam does not suggest) reads
+        # as not owned for that title alone; the check still speaks.
+        assert owned_verdicts(["A Game", "Other Game"],
+                              {"A Game": [(1234, "A Game")], "Other Game": []}, {1234}) == {
+            "A Game": True, "Other Game": False}
+        # Silence about everything, with no app ids either, is a broken
+        # reading: the check cannot speak, and the caller fails closed.
+        assert owned_verdicts(["A Game"], {}, {1234}) is None
+        assert owned_verdicts(["A Game", "Other Game"], {"A Game": [], "Other Game": []},
+                              {1234}) is None
+
+    def test_a_known_app_id_decides_without_searching(self):
+        # Humble's own data names the app: the id in the library settles it,
+        # and a same-named stranger app in the library does not.
+        assert owned_verdicts(["Deep Rock Galactic: Survivor"], {}, {2321470},
+                              {"Deep Rock Galactic: Survivor": 2321470}) == {
+            "Deep Rock Galactic: Survivor": True}
+        assert owned_verdicts(["Deep Rock Galactic: Survivor"],
+                              {"Deep Rock Galactic: Survivor": [(9999, "Deep Rock Galactic: Survivor")]},
+                              {9999}, {"Deep Rock Galactic: Survivor": 2321470}) == {
+            "Deep Rock Galactic: Survivor": False}
