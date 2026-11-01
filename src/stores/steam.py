@@ -154,8 +154,22 @@ def is_waiting_steam_key(status: str | None, code: str | None, extra: str | None
         return False
 
 
+def row_app_id(extra: str | None) -> int:
+    """The Steam app id a waiting key's row remembers, when its source named one.
+
+    Humble's lineup names each game's app outright; a row saved from it
+    carries the id, and the library check then decides by the id instead
+    of searching by title. 0 when the row names none.
+    """
+    try:
+        return int(json.loads(extra or "{}").get("steam_app_id") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
 # ---------------------------------------------------------------------------
-# Your Steam library, read for another store (Humble's unrevealed keys)
+# Your Steam library, read by the key queue: a waiting key for a game you
+# already own is a spare, not an activation.
 # ---------------------------------------------------------------------------
 
 # Steam's own record of your account: the app ids you own, asked from inside
@@ -340,7 +354,7 @@ class SteamClaimer(BaseClaimer):
             await self.close_browser()
 
     # ------------------------------------------------------------------
-    # Keys other stores handed out (Fanatical giveaways)
+    # Keys other stores handed out (Fanatical, Humble, ...)
     # ------------------------------------------------------------------
 
     async def redeem_pending_keys(self) -> None:
@@ -353,7 +367,8 @@ class SteamClaimer(BaseClaimer):
             rows = (await session.execute(
                 select(ClaimedGame).where(ClaimedGame.status == "claimed", ClaimedGame.code.isnot(None))
             )).scalars().all()
-        waiting = [(r.id, r.title, r.code) for r in rows if is_waiting_steam_key(r.status, r.code, r.extra)]
+        waiting = [(r.id, r.title, r.code, r.extra) for r in rows
+                   if is_waiting_steam_key(r.status, r.code, r.extra)]
         if not waiting:
             logger.debug("No Steam keys waiting to be activated.")
             return
@@ -367,13 +382,80 @@ class SteamClaimer(BaseClaimer):
                 logger.error("Not signed in to Steam, the %d key(s) stay queued for the next run.", len(waiting))
                 needs_you(self.store_name, len(waiting), "key")
                 return
-            for row_id, title, key in waiting:
+            # One library check for the whole queue, whichever store handed
+            # the keys out: a key for a game already in your library is a
+            # duplicate, and duplicates are never activated. With a
+            # duplicates channel configured the key is posted there as a
+            # spare; without one it is simply marked as already owned, the
+            # end state Steam's own answer would have produced, without
+            # spending an activation attempt on it. When the library
+            # cannot be read, the keys activate as usual and Steam's
+            # "already owned" answer sorts a duplicate out at the
+            # activation page (see _activate_key).
+            from src.core.notifier import duplicates_enabled
+
+            verdicts = None
+            if not cfg.dryrun:
+                app_ids = {}
+                for _row_id, title, _key, extra in waiting:
+                    app_id = row_app_id(extra)
+                    if app_id:
+                        app_ids[title] = app_id
+                verdicts = await self._library_verdicts([t for _, t, _, _ in waiting], app_ids)
+                if verdicts is None:
+                    logger.warning("Your Steam library could not be checked, so the waiting "
+                                   "key(s) are activated as usual.")
+            for row_id, title, key, _extra in waiting:
+                if verdicts and verdicts.get(title):
+                    if duplicates_enabled():
+                        await self._divert_extra_key(row_id, title, key)
+                    else:
+                        await self._mark_duplicate(row_id, title)
+                    continue
                 if not await self._activate_key(row_id, title, key):
                     break
         except Exception:
             logger.exception("Fatal error during Steam key activation")
         finally:
             await self.close_browser()
+
+    async def _divert_extra_key(self, row_id: int, title: str, key: str) -> None:
+        """Post one spare Steam key to the duplicates channel instead of activating it.
+
+        The key's game is already in your library, whichever store handed
+        the key out. The row is marked notified, so the queue never picks
+        it up again.
+        """
+        from src.core.database import ClaimedGame
+        from src.core.notifier import markdown_safe, notify_duplicates
+
+        logger.info("'%s' is already in your Steam library; its key goes to the extra keys channel.",
+                    title)
+        async with async_session() as session:
+            row = await session.get(ClaimedGame, row_id)
+            if row:
+                row.status = "notified"
+                await session.commit()
+        await notify_duplicates(
+            f"🎁 **{markdown_safe(title)}** - spare Steam key (already in your library)\n`{key}`")
+        self.notify_games.append({"title": title, "url": URL_REGISTER_KEY, "status": "notified"})
+
+    async def _mark_duplicate(self, row_id: int, title: str) -> None:
+        """Set one duplicate key aside without activating it: its game is already owned.
+
+        The end state Steam's own already-owned answer produces, reached
+        without spending an activation attempt. The key itself stays
+        valid in whichever library handed it out.
+        """
+        from src.core.database import ClaimedGame
+
+        logger.info("'%s' is already in your Steam library; its key is left unactivated.", title)
+        async with async_session() as session:
+            row = await session.get(ClaimedGame, row_id)
+            if row:
+                row.status = "existed"
+                await session.commit()
+        self.notify_games.append({"title": title, "url": URL_REGISTER_KEY, "status": "existed"})
 
     async def _activate_key(self, row_id: int, title: str, key: str) -> bool:
         """Enter one key on Steam's activation page. False when the rest should wait for the next run."""
@@ -420,10 +502,22 @@ class SteamClaimer(BaseClaimer):
             return False
 
         db_status, shown = KEY_OUTCOMES[outcome]
+        post_spare = False
         if outcome == "activated":
             logger.info("✓ Activated the Steam key for '%s'.", title)
         elif outcome == "owned":
-            logger.info("'%s' is already on your Steam account, the key stays unused in your Fanatical library.", title)
+            # Steam's own answer is the backstop for the queue's library
+            # check: the game is owned, the key was not consumed, and with
+            # a duplicates channel configured it is a spare like any other.
+            from src.core.notifier import duplicates_enabled
+
+            if duplicates_enabled():
+                logger.info("'%s' is already on your Steam account; its key goes to the "
+                            "extra keys channel.", title)
+                db_status, shown = "notified", "notified"
+                post_spare = True
+            else:
+                logger.info("'%s' is already on your Steam account, the key stays unused in your Fanatical library.", title)
         else:
             logger.warning("Steam did not take the key for '%s' (%s), it stays in your Fanatical library.", title, outcome)
         async with async_session() as session:
@@ -431,8 +525,69 @@ class SteamClaimer(BaseClaimer):
             if row:
                 row.status = db_status
                 await session.commit()
+        if post_spare:
+            from src.core.notifier import markdown_safe, notify_duplicates
+
+            await notify_duplicates(
+                f"🎁 **{markdown_safe(title)}** - spare Steam key (already in your library)\n`{key}`")
         self.notify_games.append({"title": label, "url": URL_REGISTER_KEY, "status": shown})
         return True
+
+    async def _library_verdicts(self, titles: list, app_ids: dict | None = None) -> dict | None:
+        """Which of these titles are already in your Steam library; None when it cannot be read.
+
+        Asked on this claimer's own signed-in session. Steam's own userdata
+        names the apps you own; a title with a known app id is decided by
+        it, and its search suggestions name the app for the titles without
+        one. A title no suggestion names and no app id covers counts as
+        not owned, with a warning: the activation page itself is the
+        backstop for that one (see _activate_key).
+        """
+        wanted = [t for t in dict.fromkeys(titles or []) if str(t).strip()]
+        if not wanted:
+            return {}
+
+        async def _fetch_text(url: str) -> tuple[int, str]:
+            try:
+                raw = await self.page.evaluate(FETCH_TEXT_JS % json.dumps(url), await_promise=True)
+                answer = json.loads(raw) if isinstance(raw, str) else {}
+            except Exception as e:
+                logger.debug("Steam library request failed: %s", e)
+                return 0, ""
+            return int(answer.get("status") or 0), str(answer.get("body") or "")
+
+        try:
+            status, body = await _fetch_text(URL_USERDATA)
+            try:
+                payload = json.loads(body or "")
+            except (TypeError, ValueError):
+                payload = None
+            owned = owned_app_ids(payload)
+            if owned is None:
+                logger.warning("Steam's library data answered %s and could not be read.", status)
+                return None
+
+            candidates_by_title = {}
+            for title in wanted:
+                if (app_ids or {}).get(title):
+                    continue  # The app id decides this one; no search needed.
+                _, suggest_html = await _fetch_text(URL_SUGGEST.format(term=quote_plus(str(title))))
+                candidates_by_title[title] = suggest_candidates(suggest_html)
+            verdicts = owned_verdicts(wanted, candidates_by_title, owned, app_ids)
+            if verdicts is None:
+                logger.warning("Steam's suggestions named no app for any title, so your "
+                               "library cannot be checked this run.")
+                return None
+            for title in wanted:
+                if not (app_ids or {}).get(title) and not candidates_by_title.get(title):
+                    logger.warning("Steam's suggestions named no app for '%s' and no app id is "
+                                   "known for it, so it is treated as not in your library.", title)
+            logger.debug("Steam library check: %d of %d title(s) already owned.",
+                         sum(1 for v in verdicts.values() if v), len(verdicts))
+            return verdicts
+        except Exception:
+            logger.exception("Steam library check failed")
+            return None
 
     # ------------------------------------------------------------------
     # Finding free games
@@ -1166,10 +1321,9 @@ async def steam_owned_verdicts(titles: list[str],
 
     One Steam session on Steam's own browser profile (STEAM_USERNAME /
     STEAM_PASSWORD, or the sign-in already saved there), opened and closed
-    for the check alone, so a caller in another store can ask before it
-    hands out a Steam key it cannot take back. Steam's own userdata names
-    the apps you own; a title with a known app id is decided by it, and
-    its search suggestions name the app for the titles without one.
+    for the check alone, so a caller outside the Steam store can ask. The
+    key queue asks the same question on its own session instead - see
+    SteamClaimer._library_verdicts.
     """
     wanted = [t for t in dict.fromkeys(titles or []) if str(t).strip()]
     if not wanted:
@@ -1185,49 +1339,13 @@ async def steam_owned_verdicts(titles: list[str],
         if not await claimer._ensure_logged_in(URL_STORE):
             logger.warning("Steam sign-in did not finish, so your library cannot be checked.")
             return None
-
-        async def _fetch_text(url: str) -> tuple[int, str]:
-            try:
-                raw = await claimer.page.evaluate(FETCH_TEXT_JS % json.dumps(url), await_promise=True)
-                answer = json.loads(raw) if isinstance(raw, str) else {}
-            except Exception as e:
-                logger.debug("Steam library request failed: %s", e)
-                return 0, ""
-            return int(answer.get("status") or 0), str(answer.get("body") or "")
-
-        status, body = await _fetch_text(URL_USERDATA)
-        try:
-            payload = json.loads(body or "")
-        except (TypeError, ValueError):
-            payload = None
-        owned = owned_app_ids(payload)
-        if owned is None:
-            logger.warning("Steam's library data answered %s and could not be read.", status)
-            return None
-
-        candidates_by_title = {}
-        for title in wanted:
-            if (app_ids or {}).get(title):
-                continue  # The app id decides this one; no search needed.
-            _, suggest_html = await _fetch_text(URL_SUGGEST.format(term=quote_plus(str(title))))
-            candidates_by_title[title] = suggest_candidates(suggest_html)
-        verdicts = owned_verdicts(wanted, candidates_by_title, owned, app_ids)
-        if verdicts is None:
-            logger.warning("Steam's suggestions named no app for any title, so your "
-                           "library cannot be checked this run.")
-            return None
-        for title in wanted:
-            if not (app_ids or {}).get(title) and not candidates_by_title.get(title):
-                logger.warning("Steam's suggestions named no app for '%s' and no app id is "
-                               "known for it, so it is treated as not in your library.", title)
-        logger.debug("Steam library check: %d of %d title(s) already owned.",
-                     sum(1 for v in verdicts.values() if v), len(verdicts))
-        return verdicts
+        return await claimer._library_verdicts(wanted, app_ids)
     except Exception:
         logger.exception("Steam library check failed")
         return None
     finally:
         await claimer.close_browser()
+
 
 
 async def claim_steam(extra_games: list | None = None) -> dict:

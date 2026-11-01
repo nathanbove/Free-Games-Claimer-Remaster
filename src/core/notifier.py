@@ -170,10 +170,11 @@ async def notify(
 def duplicates_enabled() -> bool:
     """True when spare keys have somewhere to go: a duplicates channel is set.
 
-    Stores that can hand out a key for a game already in your library key
-    their behaviour off this alone: with no channel configured, a spare key
-    keeps the older, safer treatment (a Humble key stays unrevealed, a Prime
-    code is redeemed as usual) instead of being surfaced with nowhere to go.
+    Stores key the posting off this alone. Detection does not depend on
+    it - the Steam queue checks every key against your library either
+    way - but with no channel configured a spare key is only set aside
+    (left unactivated, or redeemed as usual where a store cannot check),
+    never posted.
     """
     return bool(cfg.discord_webhook_duplicates)
 
