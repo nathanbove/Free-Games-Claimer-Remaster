@@ -9,7 +9,7 @@ import pytest
 
 from src.stores.steam import (DEMO_JS, GAMES_ONLY, KEY_OUTCOMES, REMEMBER_ME_JS, REMEMBER_ME_STATE_JS, STORE_FREE_SEARCH,
                               SteamClaimer, activation_outcome, base_game_button_js, claim_order, free_search_games,
-                              is_waiting_steam_key, owned_app_ids, owned_verdicts, suggest_candidates, title_is_owned)
+                              is_waiting_steam_key, owned_app_ids, owned_verdicts, row_app_id, suggest_candidates, title_is_owned)
 
 SOURCE = (Path(__file__).resolve().parent.parent / "src" / "stores" / "steam.py").read_text(encoding="utf-8")
 
@@ -523,3 +523,19 @@ class TestLibraryOwnershipCheck:
                               {"Deep Rock Galactic: Survivor": [(9999, "Deep Rock Galactic: Survivor")]},
                               {9999}, {"Deep Rock Galactic: Survivor": 2321470}) == {
             "Deep Rock Galactic: Survivor": False}
+
+
+class TestRowAppId:
+    """The app id a waiting key's row remembers, when its source named one."""
+
+    def test_a_named_app_id_is_read(self):
+        assert row_app_id(json.dumps({"external_store": "steam", "steam_app_id": 2321470})) == 2321470
+
+    def test_no_app_id_named_is_zero(self):
+        assert row_app_id(json.dumps({"external_store": "steam"})) == 0
+        assert row_app_id(None) == 0
+        assert row_app_id("") == 0
+        assert row_app_id("not json") == 0
+
+    def test_a_junk_app_id_is_zero(self):
+        assert row_app_id(json.dumps({"steam_app_id": "soon"})) == 0
