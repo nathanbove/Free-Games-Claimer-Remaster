@@ -7,6 +7,10 @@ Supports two notification systems:
 If both DISCORD_WEBHOOK and NOTIFY are configured, notifications are sent to
 BOTH services in parallel. If neither is set, notifications are silently
 skipped (the bot still works fine).
+
+A second Discord webhook (DISCORD_WEBHOOK_DUPLICATES) is a separate channel
+with one job: spare keys - keys for games already in your library - are posted
+there as text (see notify_duplicates), and nowhere else.
 """
 
 from __future__ import annotations
@@ -54,9 +58,14 @@ async def send_discord(
     *,
     screenshot_path: Path | None = None,
     username: str = "Free Games Claimer",
+    webhook_url: str | None = None,
 ) -> None:
-    """Send a message (and optional screenshot) to a Discord webhook."""
-    webhook_url = cfg.discord_webhook
+    """Send a message (and optional screenshot) to a Discord webhook.
+
+    webhook_url overrides the configured DISCORD_WEBHOOK; the duplicates
+    channel passes its own, so a spare key never lands in the main channel.
+    """
+    webhook_url = webhook_url or cfg.discord_webhook
     if not webhook_url:
         logger.debug("DISCORD_WEBHOOK not set – skipping Discord notification.")
         return
@@ -156,6 +165,31 @@ async def notify(
     for result in results:
         if isinstance(result, Exception):
             logger.exception("Failed to send notification", exc_info=result)
+
+
+def duplicates_enabled() -> bool:
+    """True when spare keys have somewhere to go: a duplicates channel is set.
+
+    Stores that can hand out a key for a game already in your library key
+    their behaviour off this alone: with no channel configured, a spare key
+    keeps the older, safer treatment (a Humble key stays unrevealed, a Prime
+    code is redeemed as usual) instead of being surfaced with nowhere to go.
+    """
+    return bool(cfg.discord_webhook_duplicates)
+
+
+async def notify_duplicates(message: str) -> None:
+    """Post one spare key to the duplicates channel, and nowhere else.
+
+    Plain Discord only - never Apprise, never the main webhook: the message
+    carries a live key, so it goes to exactly the one channel that exists
+    for giveaway keys.
+    """
+    if not cfg.discord_webhook_duplicates:
+        logger.debug("DISCORD_WEBHOOK_DUPLICATES not set – skipping duplicates post.")
+        return
+    await send_discord(message, webhook_url=cfg.discord_webhook_duplicates,
+                       username="Free Games Claimer - Extra Keys")
 
 
 # An underscore or asterisk touching a word edge turns into italics, one inside a word does not.
