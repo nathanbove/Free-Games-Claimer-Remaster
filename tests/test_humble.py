@@ -10,6 +10,7 @@ from datetime import date
 from src.stores.humble import (
     choose_identifiers,
     choose_outcome,
+    choose_already,
     payload_snippet,
     extract_tpks,
     is_choice_order,
@@ -142,6 +143,15 @@ class TestRevealOutcome:
         assert reveal_outcome(200, {"success": False}) == "failed"
         assert reveal_outcome(500, None) == "failed"
 
+    def test_an_empty_key_pool_is_exhausted_not_failed(self):
+        # Humble's real answer, captured live: the pool refills on their
+        # side, so this is a wait state, not a reveal that failed.
+        answer = {"error": "keys_depleted_email",
+                  "error_msg": "Keys are temporarily exhausted for this product",
+                  "success": False}
+        assert reveal_outcome(200, answer) == "exhausted"
+        assert reveal_outcome(200, {"error_msg": "Keys are temporarily exhausted"}) == "exhausted"
+
 
 class TestChooseOutcome:
     def test_success_counts(self):
@@ -157,6 +167,21 @@ class TestChooseOutcome:
     def test_a_plain_refusal_does_not(self):
         assert choose_outcome(403, {}) is False
         assert choose_outcome(200, {"success": False}) is False
+
+
+class TestChooseAlready:
+    def test_the_observed_answer(self):
+        answer = {"errors": {"dummy": ["You've already made this choice. "
+                                        "Please refresh the page to see your choice."]},
+                  "success": False}
+        assert choose_already(answer) is True
+
+    def test_a_confirmation_is_not_already(self):
+        assert choose_already({"success": True}) is False
+
+    def test_an_unrelated_refusal_is_not_already(self):
+        assert choose_already({"success": False, "error": "nope"}) is False
+        assert choose_already(None) is False
 
 
 class TestPayloadSnippet:
