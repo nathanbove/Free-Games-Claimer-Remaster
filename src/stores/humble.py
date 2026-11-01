@@ -31,12 +31,13 @@ What a run does, in order:
      cannot see a game that was never selected on the site: it has
      no key entry there yet. Lineup games without an entry join the run as
      waiting games in their own right. For every
-     game whose key is still unrevealed
-     and unexpired: ask Humble to choose the month's content (one call per
-     month, by the short identifiers the site's own claim button sends),
-     then reveal each key with one call per game. Choosing a game that
-     had no entry is what makes Humble create it, so the order is read
-     once more before the reveals. Both calls run inside the page, because
+     game whose key is still unrevealed and unexpired, the run walks the
+     site's own claim sequence for that one game: choose it (by the short
+     identifier the site's claim button sends), read the order once more
+     - choosing a game that had no entry is what makes Humble create it -
+     then reveal its key. One game at a time: a single call choosing the
+     whole month answered success while creating an entry for only the
+     game that already had one. Both calls run inside the page, because
      Humble's anti-bot check turns away plain HTTP clients on those two
      endpoints while reads pass.
   4. Save each revealed key in the database, tagged with the store it
@@ -55,6 +56,14 @@ channel when one is configured, never activated on your account),
 whichever store handed the key out. What this store does hand over is
 the Steam app id the month's page named for a game, saved on the key's
 row so that check can decide by the app id instead of by title.
+
+One answer is a wait state, not an error: Humble can be out of keys for
+a game (its reveal answer is "keys_depleted_email" - "Keys are
+temporarily exhausted for this product"). There is nothing to fix and
+nothing to do: the key simply is not there yet. The game stays
+unrevealed, the run reports it as failed:keys-exhausted so the state
+stays visible without reading as a fault, and because a run plans from
+the order's live state, the next run tries it again on its own.
 
 Revealing is one-way: a revealed key can no longer be gifted from Humble,
 and a month with a revealed key in it is no longer refundable. That is why
@@ -492,17 +501,23 @@ def unchosen_tpks(order: dict, lineup: list) -> list[dict]:
 
 
 def reveal_outcome(http_status: int, payload) -> str:
-    """What a redeemkey answer means: revealed, already, blocked or failed.
+    """What a redeemkey answer means: revealed, already, exhausted, blocked or failed.
 
     "Blocked" is a 401/403: the session died or the anti-bot check answered,
     and no other key in this run would fare better, so the run stops there.
+    "Exhausted" is Humble's key pool for the game standing empty
+    ("keys_depleted_email"): a wait state on their side, not a fault here.
     """
     payload = payload if isinstance(payload, dict) else {}
     if payload.get("success") is True:
         return "revealed"
     if http_status in (401, 403):
         return "blocked"
+    if payload.get("error") == "keys_depleted_email":
+        return "exhausted"
     said = json.dumps(payload).lower()
+    if "exhausted" in said:
+        return "exhausted"
     if "already" in said:
         return "already"
     return "failed"
@@ -519,6 +534,20 @@ def choose_outcome(http_status: int, payload) -> bool:
     """
     payload = payload if isinstance(payload, dict) else {}
     return payload.get("success") is True
+
+
+def choose_already(payload) -> bool:
+    """True when Humble's choose answer is that the choice was already made.
+
+    The observed shape is success:false with the refusal in the errors
+    ("You've already made this choice."). Not a confirmation - the strict
+    choose_outcome stays the judge of that - and not a problem either:
+    the choice stands, which is all the reveal that follows needs.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    if payload.get("success") is True:
+        return False
+    return "already made this choice" in json.dumps(payload).lower()
 
 
 def payload_snippet(payload) -> str:
@@ -868,6 +897,8 @@ class HumbleClaimer(BaseClaimer):
         chosen = choose_outcome(status, payload)
         if chosen:
             logger.debug("Choosing '%s' answered %s (chosen).", tpk["title"], status)
+        elif choose_already(payload):
+            logger.debug("Choosing '%s' answered %s (already chosen).", tpk["title"], status)
         else:
             logger.warning("Choosing '%s' was not confirmed (HTTP %s): %s",
                            tpk["title"], status, payload_snippet(payload))
@@ -948,6 +979,20 @@ class HumbleClaimer(BaseClaimer):
             await self._remember(tpk, "existed", overwrite=False)
             self.notify_games.append({"title": tpk["title"], "url": URL_KEYS, "status": "existed"})
             return "claimed"
+
+        if outcome == "exhausted":
+            # Humble's key pool for this game is empty right now. Nothing
+            # is broken and nothing needs doing - the key is simply not
+            # there yet - so the game stays unrevealed and planned again
+            # by the next run, and the report names the state instead of
+            # reading as a reveal that failed.
+            logger.warning("Humble is temporarily out of keys for '%s', so there is no key "
+                           "to reveal yet. Nothing needs doing; it will be tried again on "
+                           "the next run.", tpk["title"])
+            await self._remember(tpk, "failed:keys-exhausted")
+            self.notify_games.append({"title": tpk["title"], "url": URL_KEYS,
+                                      "status": "failed:keys-exhausted"})
+            return "failed"
 
         key = str((payload or {}).get("key") or "") if outcome == "revealed" else ""
         if not key and "keyless" not in (tpk["machine_name"] or ""):
