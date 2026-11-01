@@ -509,12 +509,35 @@ def reveal_outcome(http_status: int, payload) -> str:
 
 
 def choose_outcome(http_status: int, payload) -> bool:
-    """True when the month's content counts as chosen: Humble said so, or it already was."""
+    """True only when Humble confirmed the choice outright.
+
+    An answer that merely mentions choosing is not a confirmation: an error
+    payload can echo the request's own field names, and reading one as
+    success once left a game "chosen" in the log while Humble created no
+    key entry for it. Whether a choice landed is proven by the order
+    re-read that follows, not by wording.
+    """
     payload = payload if isinstance(payload, dict) else {}
-    if payload.get("success") is True:
-        return True
-    said = json.dumps(payload).lower()
-    return "already" in said or "chosen" in said
+    return payload.get("success") is True
+
+
+def payload_snippet(payload) -> str:
+    """What Humble answered, safe to log: any key value masked, the rest verbatim.
+
+    The claim calls used to log only the HTTP status, so a 200 that carried
+    no key was undiagnosable after the fact. This keeps the answer's shape
+    (and its error text, when it sends any) in the log without ever
+    printing a revealed key.
+    """
+    if payload is None:
+        return "(no JSON body)"
+    if isinstance(payload, dict):
+        shown = {name: ("***" if name == "key" and value else value)
+                 for name, value in payload.items()}
+        text = json.dumps(shown, default=str)
+    else:
+        text = str(payload)
+    return text[:240]
 
 
 class HumbleClaimer(BaseClaimer):
@@ -825,24 +848,29 @@ class HumbleClaimer(BaseClaimer):
                 obj.extra = json.dumps(extra)
             await session.commit()
 
-    async def _choose_month(self, order: dict, planned: list) -> bool:
-        """Choose a plan's games in one call, by the identifiers the page itself uses.
+    async def _choose_game(self, order: dict, tpk: dict) -> bool:
+        """Choose one game, by the identifier the page itself uses.
 
-        The identifiers are the short forms (choose_identifiers), the shape
-        the site's own claim button sends. For a current-plan month the
-        content is normally chosen already, and Humble saying so counts as
-        chosen too: revealing the keys is the step that decides, this one
-        only opens it — and for a game that had no key entry yet, it is
-        what makes Humble create one.
+        The identifier is the short form (choose_identifiers), the shape
+        the site's own claim button sends - and it goes alone: the one
+        captured wire trace of a working claim chooses a single game, and
+        a batch call answered 200 while creating a key entry for only the
+        game that already had one. A refusal is logged with Humble's own
+        answer; the caller decides from the order, not from this, whether
+        the game can still be revealed.
         """
-        identifiers = choose_identifiers(planned)
+        identifiers = choose_identifiers([tpk])
         if not identifiers:
             return True
         form = [["gamekey", str(order.get("gamekey") or "")], ["parent_identifier", "initial"]]
         form += [["chosen_identifiers[]", identifier] for identifier in identifiers]
         status, payload = await self._fetch(API_CHOOSE, form)
         chosen = choose_outcome(status, payload)
-        logger.debug("Choosing the month answered %s (%s).", status, "chosen" if chosen else "not chosen")
+        if chosen:
+            logger.debug("Choosing '%s' answered %s (chosen).", tpk["title"], status)
+        else:
+            logger.warning("Choosing '%s' was not confirmed (HTTP %s): %s",
+                           tpk["title"], status, payload_snippet(payload))
         return chosen
 
     async def _month_lineup(self, order: dict) -> list | None:
@@ -868,35 +896,41 @@ class HumbleClaimer(BaseClaimer):
                            "invisible this run.")
         return lineup
 
-    async def _materialize(self, order: dict, planned: list) -> list:
-        """Swap planned entries that had no key entry for the real ones, after choosing.
+    async def _materialize_one(self, order: dict, tpk: dict) -> dict | None:
+        """The real key entry for a game that had none, read back after choosing.
 
         Choosing is what makes Humble create a game's key entry, so the
-        order is read once more and the planned stand-ins are matched to
-        real entries by name. A game Humble still hands no entry for is
-        named and left for the next run; entries that were real all along
-        pass through untouched.
+        order is read once more and the stand-in matched to the real entry
+        by name. None when Humble still hands over no waiting entry: the
+        game is named and left for the next run.
         """
         fresh = await self._open_order(str(order.get("gamekey") or ""))
         if fresh is None:
-            logger.warning("The order could not be re-read after choosing, so the games that "
-                           "were just chosen wait for the next run.")
-            return [tpk for tpk in planned if not tpk.get("unchosen")]
-        real = {tpk["machine_name"]: tpk for tpk in extract_tpks(fresh)}
-        settled = []
-        for tpk in planned:
-            if not tpk.get("unchosen"):
-                settled.append(tpk)
-                continue
-            match = real.get(tpk["machine_name"])
-            if match is None or tpk_state(match) != "waiting":
-                logger.warning("'%s' was chosen, but Humble handed over no key entry for it; "
-                               "it waits for the next run.", tpk["title"])
-                self.notify_games.append({"title": tpk["title"], "url": URL_KEYS,
-                                          "status": "skipped:choose-failed"})
-                continue
-            settled.append(match)
-        return settled
+            logger.warning("The order could not be re-read after choosing, so '%s' waits "
+                           "for the next run.", tpk["title"])
+            return None
+        for real in extract_tpks(fresh):
+            if real["machine_name"] == tpk["machine_name"] and tpk_state(real) == "waiting":
+                return real
+        logger.warning("'%s' was chosen, but Humble handed over no key entry for it; "
+                       "it waits for the next run.", tpk["title"])
+        return None
+
+    async def _key_from_order(self, tpk: dict) -> str | None:
+        """The key for one entry as the order itself shows it now, or None.
+
+        The reveal answer is not the only place a key shows up: the order
+        carries it (redeemed_key_val) once the key stands revealed, however
+        that happened - an answer that lost the key in transit, or a reveal
+        done on the site between reading the order and asking.
+        """
+        fresh = await self._open_order(str(tpk.get("gamekey") or ""))
+        if fresh is None:
+            return None
+        for real in extract_tpks(fresh):
+            if real["machine_name"] == tpk["machine_name"] and real.get("revealed_key"):
+                return str(real["revealed_key"])
+        return None
 
     async def _reveal(self, tpk: dict) -> str:
         """Reveal one key and save it. Returns the run's standing: claimed, blocked or failed."""
@@ -914,13 +948,30 @@ class HumbleClaimer(BaseClaimer):
             await self._remember(tpk, "existed", overwrite=False)
             self.notify_games.append({"title": tpk["title"], "url": URL_KEYS, "status": "existed"})
             return "claimed"
+
+        key = str((payload or {}).get("key") or "") if outcome == "revealed" else ""
+        if not key and "keyless" not in (tpk["machine_name"] or ""):
+            # The answer carried no key. Before calling that a failure, ask
+            # the order: Humble has a known state where the reveal answer
+            # comes back without the key while the key itself stands
+            # revealed in the order - and a key revealed on the site in the
+            # meantime shows up the same way.
+            found = await self._key_from_order(tpk)
+            if found:
+                logger.info("✓ Revealed '%s' - the key was read back from the order.",
+                            tpk["title"])
+                await self._remember(tpk, "claimed", key=found,
+                                     platform=tpk["key_type"] or "humble")
+                self.notify_games.append({"title": tpk["title"], "url": URL_KEYS,
+                                          "status": "claimed"})
+                return "claimed"
         if outcome != "revealed":
-            logger.warning("Humble did not reveal the key for '%s' (HTTP %s).", tpk["title"], status)
+            logger.warning("Humble did not reveal the key for '%s' (HTTP %s): %s",
+                           tpk["title"], status, payload_snippet(payload))
             await self._remember(tpk, "failed")
             self.notify_games.append({"title": tpk["title"], "url": URL_KEYS, "status": "failed:reveal-failed"})
             return "failed"
 
-        key = str((payload or {}).get("key") or "")
         platform = tpk["key_type"] or "humble"
         if key:
             logger.info("✓ Revealed '%s' (%s key %s).", tpk["title"], platform, mask_code(key))
@@ -930,6 +981,26 @@ class HumbleClaimer(BaseClaimer):
         await self._remember(tpk, "claimed", key=key or None, platform=platform)
         self.notify_games.append({"title": tpk["title"], "url": URL_KEYS, "status": "claimed"})
         return "claimed"
+
+    async def _claim_game(self, order: dict, tpk: dict) -> str:
+        """One game end to end: choose it, read its real key entry back, reveal it.
+
+        The sequence follows the site's own claim click, one game at a
+        time. Choosing the whole month in one call answered 200 while a
+        game without a key entry never got one - the batch call registered
+        only what was already there - so each game now gets its own choose
+        call, and a game that had no entry is matched to the real one the
+        choice created before anything tries to reveal it.
+        """
+        await self._choose_game(order, tpk)
+        if tpk.get("unchosen"):
+            real = await self._materialize_one(order, tpk)
+            if real is None:
+                self.notify_games.append({"title": tpk["title"], "url": URL_KEYS,
+                                          "status": "skipped:choose-failed"})
+                return "failed"
+            tpk = real
+        return await self._reveal(tpk)
 
     async def _claim_month(self, order: dict, lineup: list | None = None) -> None:
         """Settle one Choice month: record what is settled, reveal what is waiting.
@@ -975,15 +1046,8 @@ class HumbleClaimer(BaseClaimer):
                 self.notify_games.append({"title": tpk["title"], "url": URL_KEYS, "status": "available (dry run)"})
             return
 
-        await self._choose_month(order, planned)
-        if any(tpk.get("unchosen") for tpk in planned):
-            # Choosing created their key entries; re-read the order so the
-            # reveals work on the real entries, not the stand-ins.
-            planned = await self._materialize(order, planned)
-            if not planned:
-                return
         for index, tpk in enumerate(planned):
-            if await self._reveal(tpk) == "blocked":
+            if await self._claim_game(order, tpk) == "blocked":
                 left = len(planned) - index - 1
                 if left:
                     logger.warning("%d more key(s) wait for the next run.", left)
