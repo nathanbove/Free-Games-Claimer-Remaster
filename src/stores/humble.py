@@ -10,21 +10,23 @@ What a run does, in order:
   1. Sign in (HB_EMAIL / HB_PASSWORD, an authenticator code if asked, else you
      over VNC). Humble's own JSON API, asked from inside the signed-in page,
      says whether the session is alive.
-  2. Read your order list and pick the one month to work on. The list is
-     only gamekeys — what an order is, and when it was made, lives in the
-     order itself — so classifications are kept between runs (in the data
-     folder, next to the database): an order whose product and date are
-     already known is never opened just to be classified again, and a run
-     opens only orders it has never seen, plus the one month it works on,
-     in full. The pick is the most recent Choice month from the current
-     plan, the single all-games plan sold since February 2022.
-     Pick-limited months from before that switch are left alone: their
-     unpicked games are a choice only you can make, and the bot must not
-     spend picks. Older current-plan months are left alone too: unrevealed
-     keys in them are a back catalogue to settle by hand, not a sweep for
-     a monthly run, so they stay exactly as they are.
-  3. Read the month's lineup from its membership page, because the order
-     alone cannot see a game that was never selected on the site: it has
+  2. Find the one month to work on from its membership page. The page is
+     the source: it carries the month's games (step 3) and, for the
+     signed-in reader, names their order for the month in its own data.
+     The run reads the current month's page first, stepping back a month
+     at a time when a month names no order (skipped, or not billed yet);
+     the order a page names is opened — the one full order read of the
+     run — for the state of its keys. Only when no recent page names an
+     order does the run fall back to the order list, opening orders from
+     its head until the newest Choice month turns up. The pick is a month
+     from the current plan, the single all-games plan sold since February
+     2022. Pick-limited months from before that switch are left alone:
+     their unpicked games are a choice only you can make, and the bot
+     must not spend picks. Older current-plan months are left alone too:
+     unrevealed keys in them are a back catalogue to settle by hand, not
+     a sweep for a monthly run, so they stay exactly as they are.
+  3. Work from the lineup the month's page gave, because the order alone
+     cannot see a game that was never selected on the site: it has
      no key entry there yet. Lineup games without an entry join the run as
      waiting games in their own right — the Steam check below covers them
      too, and one already in your library is never chosen, so no key entry
@@ -61,11 +63,11 @@ already been revealed, by you or by an earlier run, is never touched again.
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import re
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import date, datetime, timedelta, timezone
 
 from src.core.claimer import BaseClaimer, OTP_KEY_ATTEMPTS, account_key
 from src.core.config import cfg
@@ -183,107 +185,54 @@ def is_choice_order(order: dict) -> bool:
     return "choice" in name
 
 
-def summary_facts(entry: dict) -> dict:
-    """What one order-list entry says about its order, without opening it.
+def _first_tuesday(year: int, month: int) -> date:
+    """The first Tuesday of a month: the day its Choice lineup lands."""
+    first = date(year, month, 1)
+    return first + timedelta(days=(1 - first.weekday()) % 7)
 
-    Today's list is only gamekeys, so in practice every fact but the
-    gamekey comes back empty and the caller classifies another way; the
-    reading stays because an entry that does carry its product and date
-    should be believed. "choice" comes back None when the entry says
-    nothing about its product.
+
+def month_slugs(today: date, count: int = 4) -> list[str]:
+    """Candidate membership-page slugs, newest first, for finding your month.
+
+    The lineup in effect is the current month's from its first Tuesday
+    on; before that it is still last month's. The run probes these in
+    order and steps back when a month is not yours (skipped, or not
+    billed yet), so a few months of slack are built in.
     """
-    entry = entry or {}
-    product = entry.get("product") or {}
-    category = str(product.get("category") or "").strip().lower()
-    name = f"{product.get('machine_name') or ''} {product.get('human_name') or ''}".lower()
-    choice: bool | None = None
-    if category or name.strip():
-        choice = category == "subscription" or "choice" in name
-    return {
-        "gamekey": str(entry.get("gamekey") or ""),
-        "choice": choice,
-        "created": order_created(entry),
-        "human_name": str(product.get("human_name") or ""),
-    }
+    year, month = today.year, today.month
+    if today < _first_tuesday(year, month):
+        month -= 1
+        if month == 0:
+            year, month = year - 1, 12
+    slugs = []
+    for _ in range(max(1, count)):
+        slugs.append(f"{calendar.month_name[month].lower()}-{year}")
+        month -= 1
+        if month == 0:
+            year, month = year - 1, 12
+    return slugs
 
 
-def detail_facts(order: dict, gamekey: str) -> dict:
-    """summary_facts for an order opened in full, under the gamekey asked for."""
-    product = (order or {}).get("product") or {}
-    return {
-        "gamekey": gamekey,
-        "choice": is_choice_order(order),
-        "created": order_created(order),
-        "human_name": str(product.get("human_name") or ""),
-    }
+def page_gamekey(page: str | None) -> str | None:
+    """The order a membership page names for its month, or None.
 
-
-def pick_month(facts: list) -> tuple[dict | None, list, int]:
-    """Split classified orders into (the month to work on, legacy months, older count).
-
-    The month to work on is the most recent current-plan Choice month, the
-    legacy months are the pick-limited ones from before February 2022, and
-    the count is how many other current-plan months are left alone. A date
-    that cannot be read counts as current-plan, not legacy: its games are
-    visible either way, and a stamp Humble changes one day must not quietly
-    retire every month there is. It still ranks oldest when the newest
-    month is picked, so the same changed stamp cannot promote it either.
+    The page's per-game key data carries the gamekey of the signed-in
+    reader's order for the month. Signed out, or for a month that is
+    not the reader's, it names none — which is how the run tells a
+    month of yours from a month that merely exists.
     """
-    legacy, current = [], []
-    for fact in facts or []:
-        if not fact.get("choice"):
-            continue
-        created = fact.get("created")
-        if created is not None and created < LEGACY_CUTOFF:
-            legacy.append(fact)
-        else:
-            current.append(fact)
-    epoch = datetime.min.replace(tzinfo=timezone.utc)
-    latest = max(current, key=lambda fact: fact.get("created") or epoch) if current else None
-    older = len(current) - 1 if latest is not None else 0
-    return latest, legacy, older
-
-
-def facts_to_cache(facts: list) -> dict:
-    """The kept form of classified orders: gamekey -> the facts a pick needs.
-
-    An order's product and date never change once it exists, so what one
-    run learned about an order stays true for every later run.
-    """
-    kept = {}
-    for fact in facts or []:
-        gamekey = fact.get("gamekey") or ""
-        if not gamekey or fact.get("choice") is None:
-            continue
-        created = fact.get("created")
-        kept[gamekey] = {
-            "choice": bool(fact["choice"]),
-            "created": created.isoformat() if created else None,
-            "human_name": fact.get("human_name") or "",
-        }
-    return kept
-
-
-def facts_from_cache(cache: dict) -> dict:
-    """Kept classifications back into pick_month's shape, keyed by gamekey.
-
-    Malformed entries are dropped, never guessed at. A kept stamp that no
-    longer parses loses its date and keeps its verdict: the order then
-    counts as current-plan and ranks oldest, the same calls an unreadable
-    live stamp gets.
-    """
-    facts = {}
-    for gamekey, kept in (cache or {}).items():
-        if not isinstance(kept, dict) or "choice" not in kept:
-            continue
-        raw = kept.get("created")
-        facts[str(gamekey)] = {
-            "gamekey": str(gamekey),
-            "choice": bool(kept["choice"]),
-            "created": order_created({"created": raw}) if raw else None,
-            "human_name": str(kept.get("human_name") or ""),
-        }
-    return facts
+    if not page:
+        return None
+    blob = _embedded_choice_options(page)
+    if blob is None:
+        return None
+    data = blob.get("contentChoiceData") or {}
+    for entry in (data.get("game_data") or {}).values():
+        for tpkd in (entry or {}).get("tpkds") or []:
+            gamekey = str(tpkd.get("gamekey") or "")
+            if gamekey:
+                return gamekey
+    return None
 
 
 def extract_tpks(order: dict) -> list[dict]:
@@ -481,7 +430,8 @@ def month_lineup(page: str | None, product_machine: str = "") -> list | None:
     blob = _embedded_choice_options(page)
     if blob is None:
         return None
-    if product_machine and str(blob.get("productMachineName") or "") != product_machine:
+    blob_machine = str(blob.get("productMachineName") or "")
+    if product_machine and blob_machine != product_machine and not blob_machine.startswith(product_machine + "_"):
         return None
     data = blob.get("contentChoiceData") or {}
     game_data = data.get("game_data") or {}
@@ -707,94 +657,121 @@ class HumbleClaimer(BaseClaimer):
             return None
         return order
 
-    def _facts_cache_path(self) -> Path:
-        """Where order classifications are kept: the data folder, by the database."""
-        return cfg.browser_dir.parent / "humble-order-facts.json"
+    async def _probe_month(self, slug: str) -> dict:
+        """One membership page, read for its lineup and the order it names.
 
-    def _read_facts_cache(self) -> dict:
-        """Classifications kept from earlier runs; an unreadable file means none kept."""
-        try:
-            data = json.loads(self._facts_cache_path().read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-        return facts_from_cache(data if isinstance(data, dict) else {})
-
-    def _write_facts_cache(self, facts: list) -> None:
-        """Keep this run's classifications for the next one.
-
-        A failed write costs the next run its speed, never its pick, so it
-        is noted at debug level and the run carries on.
+        The answer carries "fetched" (the page itself answered), "lineup"
+        (its games, or None when its data cannot be read) and "gamekey"
+        (the order it names for the signed-in reader, or None when the
+        month is not theirs: skipped, or not billed yet).
         """
-        try:
-            path = self._facts_cache_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(facts_to_cache(facts), indent=1, sort_keys=True),
-                            encoding="utf-8")
-        except OSError:
-            logger.debug("The order classifications could not be kept for the next run.")
+        status, page = await self._fetch_text(f"/membership/{slug}")
+        if status != 200 or not page:
+            return {"fetched": False, "lineup": None, "gamekey": None}
+        lineup = month_lineup(page, slug.replace("-", "_"))
+        if lineup is None:
+            return {"fetched": True, "lineup": None, "gamekey": None}
+        return {"fetched": True, "lineup": lineup, "gamekey": page_gamekey(page)}
 
-    async def _latest_choice_order(self) -> dict | None:
-        """The one Choice month this run works on, opened in full, or None.
+    async def _settle_month(self, order: dict, slug: str) -> dict | None:
+        """The picked month, checked before anything is claimed from it.
 
-        The order list is only gamekeys, so classifying an order means
-        opening it — once. Classifications are kept between runs
-        (facts_to_cache), and a run opens in full only the orders it has
-        never seen, plus the month it picks. Should the list itself ever
-        carry an entry's product and date, those are used first and the
-        kept answers stay a fallback.
+        The order a page names must be that month's Choice order and a
+        current-plan one: anything else means the data disagrees with
+        itself, and the run stops loudly rather than claim from the
+        wrong month. A pick-limited month is left alone, as ever.
+        Returns {"order": ..., "human_name": ...} or None.
+        """
+        product = order.get("product") or {}
+        machine = str(product.get("machine_name") or "")
+        if not is_choice_order(order) or not machine.startswith(slug.replace("-", "_")):
+            logger.warning("The order the membership page named is not the %s Choice "
+                           "month, so nothing is claimed this run.", slug)
+            return None
+        human = str(product.get("human_name") or machine)
+        created = order_created(order)
+        if created is not None and created < LEGACY_CUTOFF:
+            logger.info("'%s' is a pick-limited month from before February 2022, "
+                        "left alone: its unpicked games are yours to choose.", human)
+            self.notify_games.append({"title": human, "url": URL_MEMBERSHIP,
+                                      "status": "skipped:legacy-month"})
+            return None
+        return {"order": order, "human_name": human}
+
+    async def _current_month(self) -> tuple[dict, list | None] | None:
+        """The month this run works on: (its order, opened once; its lineup).
+
+        Page-first: the current month's membership page, then one month
+        back at a time, until a page names an order. Only when no recent
+        page names one does the run fall back to the order list.
+        """
+        today = datetime.now().date()
+        for slug in month_slugs(today):
+            probe = await self._probe_month(slug)
+            if not probe["fetched"]:
+                logger.debug("The %s membership page did not answer; stepping back.", slug)
+                continue
+            if probe["lineup"] is None:
+                logger.warning("The %s membership page answered but its lineup could not "
+                               "be read, so no month can be settled this run.", slug)
+                return None
+            if not probe["gamekey"]:
+                logger.debug("The %s month names no order of yours; stepping back.", slug)
+                continue
+            order = await self._open_order(probe["gamekey"])
+            if order is None:
+                logger.warning("The order for the %s month could not be opened, so "
+                               "nothing is claimed this run.", slug)
+                return None
+            settled = await self._settle_month(order, slug)
+            if settled is None:
+                return None
+            logger.info("Working on '%s', found from its membership page.",
+                        settled["human_name"])
+            return settled["order"], probe["lineup"]
+        logger.warning("No recent membership page named an order of yours, so the "
+                       "month is looked for in the order list instead.")
+        return await self._fallback_month()
+
+    async def _fallback_month(self) -> tuple[dict, list | None] | None:
+        """The month from the order list, when no page names one.
+
+        The list is only gamekeys, so orders are opened from its head —
+        newest first, as Humble serves it — until the first current-plan
+        Choice month turns up, and no further. A long fruitless walk is
+        cut off rather than repeated: if the newest month is not near
+        the head, something else is wrong and the run says so.
         """
         status, payload = await self._fetch(API_ORDERS)
         if status != 200 or not isinstance(payload, list):
-            logger.warning("Humble's order list answered %s, so no month can be read this run.", status)
+            logger.warning("Humble's order list answered %s, so no month can be read "
+                           "this run.", status)
             return None
-        known = self._read_facts_cache()
-        facts_by_key, opened = {}, {}
-        unclassified = 0
+        opened = 0
         for entry in payload:
-            summary = summary_facts(entry)
-            gamekey = summary["gamekey"]
+            gamekey = str(entry.get("gamekey") or "") if isinstance(entry, dict) else ""
             if not gamekey:
                 continue
-            fact = summary if summary["choice"] is not None and summary["created"] is not None else None
-            if fact is None:
-                fact = known.get(gamekey)
-            if fact is None:
-                order = await self._open_order(gamekey)
-                if order is None:
-                    continue
-                opened[gamekey] = order
-                fact = detail_facts(order, gamekey)
-                unclassified += 1
-                if unclassified % 50 == 0:
-                    logger.info("Classifying your orders: %d opened so far, and the answers "
-                                "are kept, so this walk happens once.", unclassified)
-            facts_by_key[gamekey] = fact
-        facts = list(facts_by_key.values())
-        if unclassified:
-            logger.info("Opened %d order(s) to classify them; the answers are kept, "
-                        "so later runs open only orders they have never seen.", unclassified)
-        self._write_facts_cache(facts)
-        latest, legacy, older = pick_month(facts)
-        for fact in legacy:
-            product = fact["human_name"] or "Humble Choice (legacy month)"
-            self.notify_games.append({"title": product, "url": URL_MEMBERSHIP,
-                                      "status": "skipped:legacy-month"})
-        if legacy:
-            logger.info("%d pick-limited month(s) from before February 2022 left alone: "
-                        "their unpicked games are yours to choose.", len(legacy))
-        if latest is None:
-            return None
-        if older:
-            logger.info("Only the most recent Choice month is checked: '%s'. "
-                        "%d older month(s) left alone.",
-                        latest["human_name"] or "the newest month", older)
-        order = opened.get(latest["gamekey"])
-        if order is None:
-            order = await self._open_order(latest["gamekey"])
-        if order is None:
-            logger.warning("The most recent Choice month could not be opened, so nothing "
-                           "is claimed this run.")
-        return order
+            if opened >= 100:
+                logger.warning("A hundred orders in, no current Choice month has "
+                               "turned up; the month hunt stops here this run.")
+                return None
+            order = await self._open_order(gamekey)
+            opened += 1
+            if order is None or not is_choice_order(order):
+                continue
+            created = order_created(order)
+            if created is not None and created < LEGACY_CUTOFF:
+                continue
+            slug = membership_slug(order)
+            settled = await self._settle_month(order, slug or "")
+            if settled is None:
+                return None
+            logger.warning("Working on '%s', picked from the order list because no "
+                           "membership page named it.", settled["human_name"])
+            return settled["order"], await self._month_lineup(order)
+        logger.info("The order list holds no current Choice month either.")
+        return None
 
     async def _remember(self, tpk: dict, db_status: str, key: str | None = None,
                         platform: str = "", overwrite: bool = True) -> None:
@@ -1056,11 +1033,11 @@ class HumbleClaimer(BaseClaimer):
                 needs_you(self.store_name, 0, "game")
                 return
 
-            order = await self._latest_choice_order()
-            if order is None:
+            found = await self._current_month()
+            if found is None:
                 logger.info("No Humble Choice month is waiting to be claimed.")
                 return
-            lineup = await self._month_lineup(order)
+            order, lineup = found
             candidates = extract_tpks(order)
             if lineup:
                 candidates += unchosen_tpks(order, lineup)
