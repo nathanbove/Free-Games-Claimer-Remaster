@@ -152,6 +152,17 @@ class TestRevealOutcome:
         assert reveal_outcome(200, answer) == "exhausted"
         assert reveal_outcome(200, {"error_msg": "Keys are temporarily exhausted"}) == "exhausted"
 
+    def test_a_processing_battlenet_grant_is_pending_not_failed(self):
+        # Humble's real answer, captured live on 2026-11-03 for The Outer
+        # Worlds 2: the claim went through and the grant finishes on
+        # Blizzard's side, so this is a wait state, not a reveal that failed.
+        answer = {"error": "blizzard_pending",
+                  "error_msg": "Your Battle.net grant is still processing. "
+                               "Please try again in a moment.",
+                  "success": False}
+        assert reveal_outcome(200, answer) == "pending"
+        assert reveal_outcome(200, {"error": "blizzard_pending"}) == "pending"
+
 
 class TestChooseOutcome:
     def test_success_counts(self):

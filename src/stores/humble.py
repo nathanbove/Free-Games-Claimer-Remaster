@@ -65,6 +65,12 @@ unrevealed, the run reports it as failed:keys-exhausted so the state
 stays visible without reading as a fault, and because a run plans from
 the order's live state, the next run tries it again on its own.
 
+A linked-account grant has a wait state of its own: a Battle.net game's
+reveal can answer "blizzard_pending" - "Your Battle.net grant is still
+processing" - while the grant finishes on Blizzard's side. The same
+shape applies: nothing to fix, the game stays unrevealed, the run
+reports it as failed:grant-pending, and the next run tries it again.
+
 Revealing is one-way: a revealed key can no longer be gifted from Humble,
 and a month with a revealed key in it is no longer refundable. That is why
 this store is opt-in (name `humble` in STORES) and why a key that has
@@ -501,12 +507,14 @@ def unchosen_tpks(order: dict, lineup: list) -> list[dict]:
 
 
 def reveal_outcome(http_status: int, payload) -> str:
-    """What a redeemkey answer means: revealed, already, exhausted, blocked or failed.
+    """What a redeemkey answer means: revealed, already, exhausted, pending, blocked or failed.
 
     "Blocked" is a 401/403: the session died or the anti-bot check answered,
     and no other key in this run would fare better, so the run stops there.
     "Exhausted" is Humble's key pool for the game standing empty
     ("keys_depleted_email"): a wait state on their side, not a fault here.
+    "Pending" is a linked Battle.net grant still processing
+    ("blizzard_pending"): the same kind of wait state.
     """
     payload = payload if isinstance(payload, dict) else {}
     if payload.get("success") is True:
@@ -515,9 +523,13 @@ def reveal_outcome(http_status: int, payload) -> str:
         return "blocked"
     if payload.get("error") == "keys_depleted_email":
         return "exhausted"
+    if payload.get("error") == "blizzard_pending":
+        return "pending"
     said = json.dumps(payload).lower()
     if "exhausted" in said:
         return "exhausted"
+    if "blizzard_pending" in said:
+        return "pending"
     if "already" in said:
         return "already"
     return "failed"
@@ -992,6 +1004,21 @@ class HumbleClaimer(BaseClaimer):
             await self._remember(tpk, "failed:keys-exhausted")
             self.notify_games.append({"title": tpk["title"], "url": URL_KEYS,
                                       "status": "failed:keys-exhausted"})
+            return "failed"
+
+        if outcome == "pending":
+            # A Battle.net grant that is still processing on Blizzard's
+            # side: the claim went through, the grant just has not landed
+            # yet. Nothing is broken and nothing needs doing - the game
+            # stays unrevealed and planned again by the next run, and the
+            # report names the state instead of reading as a reveal that
+            # failed.
+            logger.warning("The Battle.net grant for '%s' is still processing, so there is "
+                           "nothing to collect yet. Nothing needs doing; it will be tried "
+                           "again on the next run.", tpk["title"])
+            await self._remember(tpk, "failed:grant-pending")
+            self.notify_games.append({"title": tpk["title"], "url": URL_KEYS,
+                                      "status": "failed:grant-pending"})
             return "failed"
 
         key = str((payload or {}).get("key") or "") if outcome == "revealed" else ""
