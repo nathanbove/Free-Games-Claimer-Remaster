@@ -6,9 +6,18 @@ order page hands the browser - a title, the entry's buttons, its whole
 text, and its platform icon's name - which is all classify_entry decides on.
 """
 
+import asyncio
+import json
 from datetime import date
 
 from src.stores.humble import (
+    AUTH_FORM_JS,
+    CONTENT_ENTRY_JS,
+    LIBRARY_LINKS_JS,
+    ORDER_ENTRIES_JS,
+    REDEEM_LINK_JS,
+    SIGNED_IN_JS,
+    HumbleClaimer,
     choice_groups,
     classify_entry,
     entry_snippet,
@@ -241,3 +250,52 @@ class TestSelectMonth:
         group, unpaid = select_month(None, [])
         assert group is None
         assert unpaid is False
+
+
+class TestOrderUrl:
+    """The order page is reached through the details dialog's 'Go to Redeem' link.
+
+    Every reading _eval_json parses hands its answer back as JSON. The
+    redeem link once did not, so the href the dialog named could never be
+    parsed ('Expecting value: line 1 column 1 (char 0)' in the run log)
+    and every run fell back to the games' own pages, where the entries
+    only the order page lists - a month's DLC packs - are invisible.
+    """
+
+    def test_every_page_reading_answers_as_json(self):
+        for js in (SIGNED_IN_JS, AUTH_FORM_JS, LIBRARY_LINKS_JS,
+                   REDEEM_LINK_JS, ORDER_ENTRIES_JS, CONTENT_ENTRY_JS):
+            assert js.strip().startswith("JSON.stringify"), js[:60]
+
+    def _claimer(self, href):
+        class FakePage:
+            async def get(self, url):
+                return None
+
+            async def evaluate(self, js, await_promise=False):
+                if "View details for" in js:
+                    return True
+                if "Go to Redeem" in js:
+                    # A browser running a JSON.stringify script hands back
+                    # the quoted string, which is what _eval_json parses.
+                    return json.dumps(href)
+                raise AssertionError(f"unexpected script: {js[:60]}")
+
+        async def _no_sleep(_seconds):
+            return None
+
+        claimer = HumbleClaimer.__new__(HumbleClaimer)
+        claimer.page = FakePage()
+        claimer.sleep = _no_sleep
+        return claimer
+
+    def test_the_dialogs_link_becomes_the_order_url(self):
+        claimer = self._claimer("/home/library/order-uuid")
+        group = {"games": [{"title": "A Game", "href": "/home/library/content/aaa"}]}
+        url = asyncio.run(claimer._order_url(group))
+        assert url == "https://www.humblebundle.com/home/library/order-uuid"
+
+    def test_a_dialog_with_no_link_falls_back(self):
+        claimer = self._claimer(None)
+        group = {"games": [{"title": "A Game", "href": "/home/library/content/aaa"}]}
+        assert asyncio.run(claimer._order_url(group)) is None
