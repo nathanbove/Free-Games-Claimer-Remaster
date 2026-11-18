@@ -224,15 +224,17 @@ CLICK_VIEW_DETAILS_JS = """
     })()
 """
 
-# The details dialog's way to the month's order page.
+# The details dialog's way to the month's order page. Like every reading
+# _eval_json parses, the answer is JSON: the bare href is not, and handing
+# it back unquoted made the parse fail and the order page unreachable.
 REDEEM_LINK_JS = """
-    (() => {
+    JSON.stringify((() => {
         const link = [...document.querySelectorAll('a')]
             .find(a => (a.textContent || '').trim() === 'Go to Redeem'
                     && (a.getAttribute('href') || '').startsWith('/home/library/')
                     && !(a.getAttribute('href') || '').includes('/content/'));
         return link ? link.getAttribute('href') : null;
-    })()
+    })())
 """
 
 # One key entry on an order page is a row with these classes; its title is
