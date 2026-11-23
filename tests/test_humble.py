@@ -222,6 +222,26 @@ class TestChoiceGroups:
         groups = choice_groups([link, dict(link)])
         assert len(groups[0]["games"]) == 1
 
+    def test_the_new_librarys_shape_groups_by_bundle_line_alone(self):
+        # The library as it stands since November 22, 2026: no bundle
+        # headings anywhere, a few games to a page, and a newer bundle's
+        # games ahead of the month's - every link's heading is empty and
+        # its bundle line alone says what it belongs to.
+        groups = choice_groups([
+            _link("", "Doors of Insanity: ReOpened", "/home/library/content/d1",
+                  sub="Deck the Halls with Deckbuilders"),
+            _link("", "Check In, Please Playtest", "/home/library/content/n1",
+                  sub="November 2026 Humble Choice"),
+            _link("", "The Outer Worlds 2", "/home/library/content/n2",
+                  sub="November 2026 Humble Choice"),
+            _link("", "Mafia: The Old Country - Padrino Pack", "/home/library/content/n3",
+                  sub="November 2026 Humble Choice"),
+        ])
+        assert [g["slug"] for g in groups] == ["november-2026"]
+        assert [g["title"] for g in groups[0]["games"]] == [
+            "Check In, Please Playtest", "The Outer Worlds 2",
+            "Mafia: The Old Country - Padrino Pack"]
+
 
 class TestSelectMonth:
     def _groups(self):
@@ -317,13 +337,35 @@ class TestPickMonth:
         group = asyncio.run(claimer._pick_month())
         assert group["slug"] == "november-2026"
         assert alerted == []
-        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY, URL_LIBRARY]
+        # The reread walks on to page 2 to finish the month's games
+        # before the walk ends on a page with no links left to give.
+        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY, URL_LIBRARY,
+                                       URL_LIBRARY + "?page=2"]
 
     def test_two_empty_reads_work_no_month_and_send_no_alert(self):
         claimer, alerted = self._claimer([[], []])
         assert asyncio.run(claimer._pick_month()) is None
         assert alerted == []
         assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY, URL_LIBRARY]
+
+    def test_a_month_behind_a_newer_bundle_is_still_picked(self):
+        # The library as it stands since November 22, 2026: the newest
+        # bundle's games fill the first page, and the month's own games
+        # follow across the next pages, named only by their bundle line.
+        deck = [_link("", "Doors of Insanity: ReOpened", "/home/library/content/d1",
+                      sub="Deck the Halls with Deckbuilders")]
+        november_a = [_link("", "Check In, Please Playtest", "/home/library/content/n1",
+                            sub="November 2026 Humble Choice")]
+        november_b = [_link("", "Mafia: The Old Country", "/home/library/content/n2",
+                            sub="November 2026 Humble Choice")]
+        other = [_link("", "An Older Game", "/home/library/content/o1",
+                       sub="Some Older Bundle")]
+        claimer, alerted = self._claimer([deck, november_a, november_b, other])
+        group = asyncio.run(claimer._pick_month())
+        assert group["slug"] == "november-2026"
+        assert [g["title"] for g in group["games"]] == [
+            "Check In, Please Playtest", "Mafia: The Old Country"]
+        assert alerted == []
 
     def test_a_current_month_the_library_does_not_hold_still_alerts(self):
         claimer, alerted = self._claimer(
@@ -332,7 +374,120 @@ class TestPickMonth:
         group = asyncio.run(claimer._pick_month())
         assert group["slug"] == "november-2026"
         assert alerted == ["december-2026"]
-        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY]
+        # December never turns up; the walk ends on the first page that
+        # hands back no links at all.
+        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY, URL_LIBRARY + "?page=2"]
+
+
+def _newlib_link(title, bundle, href):
+    """A library link as the library hands it over now: no heading, the bundle in its own line."""
+    return {"heading": "", "title": title, "sub": bundle, "href": href}
+
+
+class TestLibraryGroupsWalk:
+    """The library read walks the pagination until the wanted month is read whole.
+
+    Since November 22, 2026 the library lists a few games to a page with
+    no bundle headings, so the current month - twelve games - sits
+    straddled across pages behind anything bought after it. Reading only
+    the first page, as the pick used to, finds the newest bundle's games
+    and no month at all.
+    """
+
+    DECK_PAGE = [
+        _newlib_link("Doors of Insanity: ReOpened", "Deck the Halls with Deckbuilders",
+                     "/home/library/content/d1"),
+        _newlib_link("Lost for Swords", "Deck the Halls with Deckbuilders",
+                     "/home/library/content/d2"),
+    ]
+    NOVEMBER_PAGE_2 = [
+        _newlib_link("Check In, Please Playtest", "November 2026 Humble Choice",
+                     "/home/library/content/n1"),
+        _newlib_link("The Outer Worlds 2", "November 2026 Humble Choice",
+                     "/home/library/content/n2"),
+        _newlib_link("Mafia: The Old Country - Padrino Pack", "November 2026 Humble Choice",
+                     "/home/library/content/n3"),
+    ]
+    NOVEMBER_PAGE_3 = [
+        _newlib_link("Mafia: The Old Country - Gatto Nero Pack", "November 2026 Humble Choice",
+                     "/home/library/content/n4"),
+        _newlib_link("Mafia: The Old Country", "November 2026 Humble Choice",
+                     "/home/library/content/n5"),
+        _newlib_link("Squeakross: Home Squeak Home", "November 2026 Humble Choice",
+                     "/home/library/content/n6"),
+    ]
+    OTHER_PAGE = [
+        _newlib_link("An Older Game", "Some Older Bundle", "/home/library/content/o1"),
+    ]
+
+    def _claimer(self, pages):
+        """A claimer whose library answers page by page: `pages` maps a page number to its links."""
+
+        class FakePage:
+            def __init__(self):
+                self.visits = []
+                self.current = ""
+
+            async def get(self, url):
+                self.visits.append(url)
+                self.current = url
+                return None
+
+        async def _no_sleep(_seconds):
+            return None
+
+        claimer = HumbleClaimer.__new__(HumbleClaimer)
+        claimer.page = FakePage()
+        claimer.sleep = _no_sleep
+
+        async def _eval_json(_js, _fallback=None):
+            url = claimer.page.current
+            number = int(url.rsplit("?page=", 1)[1]) if "?page=" in url else 1
+            return pages.get(number, [])
+
+        claimer._eval_json = _eval_json
+        return claimer
+
+    def test_a_month_straddling_pages_is_read_whole(self):
+        claimer = self._claimer({1: self.DECK_PAGE, 2: self.NOVEMBER_PAGE_2,
+                                 3: self.NOVEMBER_PAGE_3, 4: self.OTHER_PAGE})
+        groups = asyncio.run(claimer._library_groups("november-2026"))
+        assert [g["slug"] for g in groups] == ["november-2026"]
+        assert [g["title"] for g in groups[0]["games"]] == [
+            "Check In, Please Playtest", "The Outer Worlds 2",
+            "Mafia: The Old Country - Padrino Pack",
+            "Mafia: The Old Country - Gatto Nero Pack", "Mafia: The Old Country",
+            "Squeakross: Home Squeak Home"]
+        # The walk stops on the first page holding none of the month's
+        # games, and never asks for page 5.
+        assert claimer.page.visits == [URL_LIBRARY, URL_LIBRARY + "?page=2",
+                                       URL_LIBRARY + "?page=3", URL_LIBRARY + "?page=4"]
+
+    def test_with_no_current_month_the_newest_month_found_is_read_whole(self):
+        claimer = self._claimer({1: self.NOVEMBER_PAGE_2, 2: self.NOVEMBER_PAGE_3,
+                                 3: self.OTHER_PAGE})
+        groups = asyncio.run(claimer._library_groups())
+        assert [g["slug"] for g in groups] == ["november-2026"]
+        assert len(groups[0]["games"]) == 6
+        assert claimer.page.visits == [URL_LIBRARY, URL_LIBRARY + "?page=2",
+                                       URL_LIBRARY + "?page=3"]
+
+    def test_a_page_with_no_links_ends_the_walk(self):
+        claimer = self._claimer({1: self.DECK_PAGE})
+        groups = asyncio.run(claimer._library_groups("november-2026"))
+        assert groups == []
+        assert claimer.page.visits == [URL_LIBRARY, URL_LIBRARY + "?page=2"]
+
+    def test_the_walk_is_capped_when_the_month_never_turns_up(self):
+        pages = {}
+        for number in range(1, 13):
+            pages[number] = [_newlib_link(f"October Game {number}",
+                                          "October 2026 Humble Choice",
+                                          f"/home/library/content/oct{number}")]
+        claimer = self._claimer(pages)
+        groups = asyncio.run(claimer._library_groups("november-2026"))
+        assert [g["slug"] for g in groups] == ["october-2026"]
+        assert len(claimer.page.visits) == 10
 
 
 class TestOrderUrl:
@@ -382,6 +537,34 @@ class TestOrderUrl:
         claimer = self._claimer(None)
         group = {"games": [{"title": "A Game", "href": "/home/library/content/aaa"}]}
         assert asyncio.run(claimer._order_url(group)) is None
+
+    def test_a_later_game_opens_the_dialog_when_the_first_has_no_button(self):
+        # The month's games as the library lists them can start with a
+        # DLC pack, which the library page's showcase has no details
+        # button for; the next game that does have one opens the dialog.
+        class FakePage:
+            async def get(self, url):
+                return None
+
+            async def evaluate(self, js, await_promise=False):
+                if "View details for" in js:
+                    return "DLC Pack" not in js
+                if "Go to Redeem" in js:
+                    return json.dumps("/home/library/order-uuid")
+                raise AssertionError(f"unexpected script: {js[:60]}")
+
+        async def _no_sleep(_seconds):
+            return None
+
+        claimer = HumbleClaimer.__new__(HumbleClaimer)
+        claimer.page = FakePage()
+        claimer.sleep = _no_sleep
+        group = {"slug": "november-2026", "games": [
+            {"title": "A Game - DLC Pack", "href": "/home/library/content/aaa"},
+            {"title": "A Game", "href": "/home/library/content/bbb"},
+        ]}
+        url = asyncio.run(claimer._order_url(group))
+        assert url == "https://www.humblebundle.com/home/library/order-uuid"
 
 
 class TestRevealedKeyAlreadyHandled:

@@ -19,7 +19,8 @@ browser:
      account asks its authenticator, or the code Humble e-mails, which only
      you can read, so that step is yours over VNC, like every other store.
   2. Find the one month to work on. The membership home names the current
-     month; your library's first page groups what you own, newest first.
+     month; your library's first pages list what you own, newest first,
+     a few games to a page, each card naming the bundle it belongs to.
      The run works the current month when it is in your library, else the
      newest month that is. When the current month is posted but not in
      your library — subscription paused, month skipped, or billing failed —
@@ -193,8 +194,9 @@ CLICK_SEND_CODE_JS = """
 # The library's game links, each with the bundle heading it sits under.
 # Headings are tracked in document order - a heading names the games that
 # follow it - because the cards' own markup does not say which bundle a
-# card belongs to; a link's own text does name its bundle, and is carried
-# along as the fallback grouping.
+# card belongs to; a link's own text does name its bundle, and on the
+# library as it stands now, with no bundle headings at all, that bundle
+# line is the grouping.
 LIBRARY_LINKS_JS = """
     JSON.stringify((() => {
         const month = /^(January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{4}/;
@@ -742,7 +744,7 @@ class HumbleClaimer(BaseClaimer):
         """The month this run works on, as {slug, heading, games}, or None.
 
         The membership home names the current month; the library's first
-        page names the months you own. The current month is the pick when
+        pages name the months you own. The current month is the pick when
         it is owned; a current month that a real library read does not
         hold is alerted as unpaid, and the newest owned month is the pick
         instead. A library read that finds no months at all proves
@@ -755,10 +757,10 @@ class HumbleClaimer(BaseClaimer):
         current_slug = parse_month_heading(await self._page_text())
         if current_slug is None:
             logger.debug("The membership page named no current Choice month.")
-        groups = await self._library_groups()
+        groups = await self._library_groups(current_slug)
         if not groups:
             logger.debug("The library read found no Choice months; reading the library once more.")
-            groups = await self._library_groups()
+            groups = await self._library_groups(current_slug)
         if not groups:
             logger.warning("The library page named no Choice months on either read, "
                            "so no month is worked and no unpaid call is made this run.")
@@ -772,41 +774,81 @@ class HumbleClaimer(BaseClaimer):
                     month_display_name(group["slug"]))
         return group
 
-    async def _library_groups(self) -> list:
-        """The Choice months the library's first page names, newest first.
+    async def _library_groups(self, current_slug: str | None = None) -> list:
+        """The Choice months the library's first pages name, newest first.
 
-        What the read found is logged - how many links it handed back,
-        and the months they grouped into - so a later empty or partial
-        read can be told apart from a library that genuinely holds less.
+        The library lists a few games to a page, newest first, with no
+        bundle headings: a card's own bundle line is what names its
+        month, and one month's games can straddle several pages, pushed
+        down by anything bought after them. So the read walks pages -
+        the address the page's own pagination names - until the month
+        being looked for (the current month, or the newest month found
+        when no current month was read) has been read whole: a page
+        holding none of its games, after pages that did, ends the walk.
+        A page with no links at all ends it too, and a cap keeps a
+        library that never names the month from being walked forever.
+
+        What each read found is logged - how many links the page handed
+        back, and the months they grouped into - so a later empty or
+        partial read can be told apart from a library that genuinely
+        holds less.
         """
-        await self.page.get(URL_LIBRARY)
-        await self.sleep(5)
-        links = await self._eval_json(LIBRARY_LINKS_JS, [])
-        links = links if isinstance(links, list) else []
-        groups = choice_groups(links)
-        logger.debug("The library read found %d link(s), in Choice month(s): %s.",
-                     len(links), [group["slug"] for group in groups] or "none")
-        return groups
+        links: list = []
+        target = current_slug
+        for page_number in range(1, 11):
+            url = URL_LIBRARY if page_number == 1 else f"{URL_LIBRARY}?page={page_number}"
+            await self.page.get(url)
+            await self.sleep(5)
+            page_links = await self._eval_json(LIBRARY_LINKS_JS, [])
+            page_links = page_links if isinstance(page_links, list) else []
+            if not page_links:
+                logger.debug("The library read found no links on page %d.", page_number)
+                break
+            links.extend(page_links)
+            groups = choice_groups(links)
+            logger.debug("The library read found %d link(s) on page %d, "
+                         "in Choice month(s): %s.", len(page_links), page_number,
+                         [group["slug"] for group in groups] or "none")
+            if target is None and groups:
+                target = groups[0]["slug"]
+            if target is None:
+                continue
+            if not any(group["slug"] == target for group in groups):
+                continue
+            page_slugs = {group["slug"] for group in choice_groups(page_links)}
+            if target not in page_slugs:
+                # The month's games ended on an earlier page; the ones
+                # already read are its whole showing here.
+                break
+        return choice_groups(links)
 
     async def _order_url(self, group: dict) -> str | None:
-        """The month's order page, by way of its first game's details dialog.
+        """The month's order page, by way of a game's details dialog.
 
         The dialog's "Go to Redeem" link is the only way the site names
-        the order page; None when the dialog does not offer it, and the
-        caller falls back to the games' own pages.
+        the order page; None when no dialog offers it, and the caller
+        falls back to the games' own pages. The library page's details
+        buttons belong to its current-month showcase, and the month's
+        games as the library lists them start with whichever its newest
+        page happened to hold - not necessarily a showcased one - so
+        each of the month's titles is tried until one opens its dialog.
         """
         if not group.get("games"):
             return None
         await self.page.get(URL_LIBRARY)
         await self.sleep(5)
-        first = group["games"][0]
-        try:
-            clicked = await self.page.evaluate(CLICK_VIEW_DETAILS_JS % json.dumps(first["title"]))
-        except Exception as e:
-            logger.debug("Could not open the details for '%s': %s", first["title"], e)
-            clicked = False
+        clicked = False
+        for game in group["games"]:
+            try:
+                clicked = await self.page.evaluate(CLICK_VIEW_DETAILS_JS % json.dumps(game["title"]))
+            except Exception as e:
+                logger.debug("Could not open the details for '%s': %s", game["title"], e)
+                clicked = False
+            if clicked:
+                break
         if not clicked:
-            logger.debug("No details button for '%s' on the library page.", first["title"])
+            logger.debug("No details button for any of '%s' games on the library page.",
+                         month_display_name(group.get("slug") or ""))
             return None
         await self.sleep(3)
         href = await self._eval_json(REDEEM_LINK_JS, None)
