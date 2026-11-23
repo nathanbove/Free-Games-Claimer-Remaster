@@ -320,7 +320,7 @@ What it leaves alone, on purpose:
 
 - **Older Choice months.** Only the most recent month is checked and claimed from. Unrevealed keys in older months stay exactly as they are — a back catalogue to settle by hand, not something a monthly run sweeps up.
 - **Months from before February 2022.** Choice was pick-limited then, so an old month's unpicked games are a choice only you can make. The newest month is never one of them any more, so the one-month rule above leaves them alone with the rest of the back catalogue.
-- **Keys already revealed**, by you or by an earlier run — one the bot itself revealed is left exactly as saved; one revealed outside the bot is recorded without its key, so it is never queued as if the bot had claimed it — and **keys whose publisher expiry has passed**, which it reports once as expired.
+- **Keys already revealed and recorded**, by you or by an earlier run — left exactly as saved — and **keys whose publisher expiry has passed**, which it reports once as expired. A revealed key with no database record is not left alone: it has never been processed, so it is saved and handed to its store, whose duplicate check decides whether it is a spare or an activation.
 - Everything that is not a Choice month: store purchases and ordinary bundles are already yours without a reveal step this bot needs to make.
 
 One honest limit: Humble draws its sign-in form with script and changes it from time to time, and its anti-bot check can still ask for you. When the automated sign-in does not finish, the bot asks you to sign in over VNC, like every other store, and carries on from there.

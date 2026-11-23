@@ -35,16 +35,17 @@ browser:
      key must be revealed by; or a keyless grant already redeemed into a
      linked account ("Redeemed on Blizzard (Battle.net)").
   4. Settle each entry. A key that stands revealed is saved in the
-     database, tagged with the store it belongs to — unless the database
-     already holds that key, or holds no row at all for the game: a key
-     revealed outside the bot, by you on the site, was never the bot's to
-     queue. A row the bot made earlier without the key in it (the reveal
-     was recorded, the key itself was not) does get the key saved, so the
-     key takes its place in the queue like any other - unless the same
-     key already stands recorded under a different game id (queued,
-     activated, or posted as a duplicate from that row), in which case
-     the key is recorded without being queued a second time. A key is
-     its string: a different key for the same game is a new key, and
+     database, tagged with the store it belongs to, so the store can
+     make its duplicate check. That includes a key with no row at
+     all: a reveal outside the bot can still be unclaimed, and no
+     row means the key has never been processed. A row the bot made
+     earlier without the key in it (the reveal was recorded, the key
+     itself was not) does get the key saved, so the key takes its
+     place in the queue like any other - unless the same key already
+     stands recorded under a different game id (queued, activated,
+     or posted as a duplicate from that row), in which case the key
+     is recorded without being queued a second time. A key is its
+     string: a different key for the same game is a new key, and
      takes its place in the queue the same way. An unrevealed key is
      revealed by pressing its Reveal button and reading the key the page
      shows afterwards; a keyless grant is recorded as claimed with no key.
@@ -930,17 +931,12 @@ class HumbleClaimer(BaseClaimer):
                                      overwrite=False)
                 self.notify_games.append({"title": title, "url": order_url, "status": "existed"})
             elif row is not None and await self._key_already_recorded(code, entry["game_id"]):
-                # The identical key already stands under a different game
-                # id - queued, activated, or posted as a duplicate from
-                # that row - so this codeless row is the "revealed outside
-                # the bot" standing after all, not the Padrino shape
-                # below: a run that first reads a month under new game
-                # ids records every entry without its key, and saving
-                # those same strings on the next run would queue them
-                # all a second time. A different string would be a
+                # The identical key already stands recorded under a
+                # different game id - queued, activated, or posted as a
+                # duplicate from that row. This codeless row therefore
+                # adds nothing: saving the same string here would queue
+                # it a second time. A different string would be a
                 # different key and would fall through to the save below.
-                # Record it without the key, the same as the no-row
-                # branch below.
                 logger.info("The key for '%s' already stands under another entry, so it is "
                             "recorded without being queued again.", title)
                 await self._remember(entry["game_id"], title, order_url, "existed")
@@ -955,13 +951,17 @@ class HumbleClaimer(BaseClaimer):
                                      key=code, platform=platform)
                 self.notify_games.append({"title": title, "url": order_url, "status": "claimed"})
             else:
-                # Revealed outside the bot - by you, on the site. It was
-                # never the bot's key to queue, so it is recorded without
-                # one, and the Steam queue never sees it.
-                logger.info("'%s' was revealed outside the bot, so it is recorded "
-                            "without its key and not queued.", title)
-                await self._remember(entry["game_id"], title, order_url, "existed")
-                self.notify_games.append({"title": title, "url": order_url, "status": "existed"})
+                # No row at all: the key has never been processed. A
+                # reveal outside the bot can still be unclaimed, so save
+                # it like a key the bot revealed itself and let its
+                # store's duplicate check decide whether it is a spare
+                # or an activation.
+                logger.info("✓ '%s' stood revealed with no record of it; its key (%s) is "
+                            "saved now and handed to its store for the duplicate check.",
+                            title, mask_code(code))
+                await self._remember(entry["game_id"], title, order_url, "claimed",
+                                     key=code, platform=platform)
+                self.notify_games.append({"title": title, "url": order_url, "status": "claimed"})
             return "settled"
 
         if state == "redeemed":

@@ -400,6 +400,10 @@ class TestRevealedKeyAlreadyHandled:
     key already stands under another id. Identity is the string, not the
     title (Nathan's ruling): a sibling holding a different key settles
     nothing - that key is a new key and is saved like any other.
+
+    No row at all is a different standing again: it means the key has
+    never been processed, so the tests below save it and hand it to its
+    store rather than treating an outside reveal as settled.
     """
 
     ORDER_URL = "https://www.humblebundle.com/home/library/order-uuid"
@@ -480,3 +484,23 @@ class TestRevealedKeyAlreadyHandled:
         assert saved[self.GAME_ID].status == "claimed" and saved[self.GAME_ID].code == self.KEY
         assert json.loads(saved[self.GAME_ID].extra)["external_store"] == "steam"
         assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "claimed"}]
+
+    def test_a_revealed_key_with_no_row_is_saved_and_queued(self, tmp_path, monkeypatch):
+        # Nathan's ruling: no row at all means the key has never been
+        # processed. A reveal outside the bot can still be unclaimed, so
+        # the key is saved exactly like one the bot revealed itself.
+        standing, notify, saved = self._settle(tmp_path, monkeypatch, [])
+        assert standing == "settled"
+        assert saved[self.GAME_ID].status == "claimed" and saved[self.GAME_ID].code == self.KEY
+        assert json.loads(saved[self.GAME_ID].extra)["external_store"] == "steam"
+        assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "claimed"}]
+
+    def test_a_revealed_key_with_no_row_is_a_waiting_steam_key(self, tmp_path, monkeypatch):
+        # The saved row is a genuine handoff, not just a record: it
+        # satisfies the Steam queue's own waiting-key test, so the
+        # redeemer will work it and make the duplicate check.
+        from src.stores.steam import is_waiting_steam_key
+
+        _standing, _notify, saved = self._settle(tmp_path, monkeypatch, [])
+        row = saved[self.GAME_ID]
+        assert is_waiting_steam_key(row.status, row.code, row.extra) is True
