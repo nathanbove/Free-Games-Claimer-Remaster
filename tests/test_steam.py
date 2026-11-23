@@ -9,7 +9,8 @@ import pytest
 
 from src.stores.steam import (DEMO_JS, GAMES_ONLY, KEY_OUTCOMES, REMEMBER_ME_JS, REMEMBER_ME_STATE_JS, STORE_FREE_SEARCH,
                               SteamClaimer, activation_outcome, base_game_button_js, claim_order, free_search_games,
-                              is_waiting_steam_key, owned_app_ids, owned_verdicts, row_app_id, suggest_candidates, title_is_owned)
+                              has_terminal_sibling, is_waiting_steam_key, owned_app_ids, owned_verdicts, row_app_id,
+                              suggest_candidates, title_is_owned)
 
 SOURCE = (Path(__file__).resolve().parent.parent / "src" / "stores" / "steam.py").read_text(encoding="utf-8")
 
@@ -539,3 +540,117 @@ class TestRowAppId:
 
     def test_a_junk_app_id_is_zero(self):
         assert row_app_id(json.dumps({"steam_app_id": "soon"})) == 0
+
+
+class TestWaitingKeyAlreadyHandled:
+    """A waiting key whose title another row already settled is never worked again.
+
+    Defense in depth behind the Humble fix: after that store's game ids
+    changed, a run saved November 2026's already-handled keys as waiting
+    again, and the queue posted all ten to the duplicates channel,
+    DYSMANTLE twice. A waiting row with a sibling row that ended claimed
+    and activated or notified now leaves the queue as existed instead -
+    unactivated, and with nothing posted.
+    """
+
+    STEAM_EXTRA = '{"external_store": "steam"}'
+
+    def _row(self, game_id, title, status, code=None):
+        from src.core.database import ClaimedGame
+        return ClaimedGame(store="humble", user="tester", game_id=game_id, title=title,
+                           status=status, code=code, extra=self.STEAM_EXTRA if code else None)
+
+    class _Queue:
+        """The redeemer's browser side, stubbed: signed in, the library speaks for no title, activations recorded."""
+
+        _settle_already_handled = SteamClaimer._settle_already_handled
+
+        def __init__(self):
+            self.notify_games, self.activated = [], []
+            self.page = self
+
+        async def start_browser(self, **kwargs):
+            pass
+
+        async def close_browser(self):
+            pass
+
+        async def get(self, url):
+            pass
+
+        async def sleep(self, seconds):
+            pass
+
+        async def _ensure_logged_in(self, url):
+            return True
+
+        async def _library_verdicts(self, titles, app_ids=None):
+            return {}
+
+        async def _activate_key(self, row_id, title, key):
+            self.activated.append(title)
+            return True
+
+    def _redeem(self, tmp_path, monkeypatch, rows):
+        """Seed the rows, work the queue against them, and read the table back."""
+        import src.core.notifier as notifier
+        import src.stores.steam as steam
+        from sqlalchemy import select
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from src.core.database import Base, ClaimedGame
+
+        posted = []
+
+        async def run():
+            engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'fgc.db'}")
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            factory = async_sessionmaker(engine, expire_on_commit=False)
+            monkeypatch.setattr(steam, "async_session", factory)
+            monkeypatch.setattr(steam.cfg, "dryrun", False)
+
+            async def record_duplicates(message):
+                posted.append(message)
+
+            monkeypatch.setattr(notifier, "notify_duplicates", record_duplicates)
+            async with factory() as session:
+                session.add_all(rows)
+                await session.commit()
+            stub = self._Queue()
+            await SteamClaimer.redeem_pending_keys(stub)
+            async with factory() as session:
+                saved = {r.game_id: r.status for r in (await session.execute(select(ClaimedGame))).scalars()}
+            await engine.dispose()
+            return stub, posted, saved
+
+        return asyncio.run(run())
+
+    def test_the_sibling_check_itself(self):
+        rows = [(1, "A Game", "claimed"), (2, "A Game", "notified"),
+                (3, "Other Game", "claimed and activated")]
+        assert has_terminal_sibling(1, "A Game", rows) is True
+        assert has_terminal_sibling(2, "A Game", rows) is False  # a row is not its own sibling
+        assert has_terminal_sibling(3, "Other Game", rows) is False  # its only terminal row is itself
+        assert has_terminal_sibling(9, "A Game", [(9, "A Game", "claimed")]) is False
+
+    @pytest.mark.parametrize("sibling_status", ["claimed and activated", "notified"])
+    def test_a_key_already_settled_under_another_row_is_set_aside(self, tmp_path, monkeypatch, sibling_status):
+        stub, posted, saved = self._redeem(tmp_path, monkeypatch, [
+            self._row("order-uuid/dysmantle", "DYSMANTLE", "claimed", code="AAAAA-BBBBB-CCCCC"),
+            self._row("old/dysmantle", "DYSMANTLE", sibling_status, code="DDDDD-EEEEE-FFFFF"),
+            self._row("order-uuid/fresh-game", "Fresh Game", "claimed", code="GGGGG-HHHHH-IIIII"),
+        ])
+        assert saved["order-uuid/dysmantle"] == "existed"
+        assert stub.activated == ["Fresh Game"]
+        assert posted == []
+
+    def test_a_waiting_key_with_no_terminal_sibling_is_activated(self, tmp_path, monkeypatch):
+        # The control: a second waiting row for the title settles nothing,
+        # so both keys are worked exactly as before.
+        stub, posted, saved = self._redeem(tmp_path, monkeypatch, [
+            self._row("order-uuid/fresh-game", "Fresh Game", "claimed", code="GGGGG-HHHHH-IIIII"),
+            self._row("old/fresh-game", "Fresh Game", "claimed", code="JJJJJ-KKKKK-LLLLL"),
+        ])
+        assert stub.activated == ["Fresh Game", "Fresh Game"]
+        assert posted == []

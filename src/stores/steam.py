@@ -167,6 +167,26 @@ def row_app_id(extra: str | None) -> int:
         return 0
 
 
+# The standings that end a key's story: it was activated on the account,
+# or it was posted to the duplicates channel as a spare.
+TERMINAL_KEY_STATUSES = ("claimed and activated", "notified")
+
+
+def has_terminal_sibling(row_id: int, title: str, rows) -> bool:
+    """Whether another row for this title already settled a key for it.
+
+    rows is every row's (id, title, status). A title can stand in the
+    database under more than one row - a source whose game ids changed
+    (Humble's, with the rebuilt site) leaves the old row beside the new
+    one - and a key saved again as waiting under the new row is the same
+    key the old row already activated or posted as a duplicate. Working
+    it again would post that key as a duplicate a second time.
+    """
+    return any(other_id != row_id and other_title == title
+               and other_status in TERMINAL_KEY_STATUSES
+               for other_id, other_title, other_status in rows)
+
+
 # ---------------------------------------------------------------------------
 # Your Steam library, read by the key queue: a waiting key for a game you
 # already own is a spare, not an activation.
@@ -367,8 +387,19 @@ class SteamClaimer(BaseClaimer):
             rows = (await session.execute(
                 select(ClaimedGame).where(ClaimedGame.status == "claimed", ClaimedGame.code.isnot(None))
             )).scalars().all()
+            standings = (await session.execute(
+                select(ClaimedGame.id, ClaimedGame.title, ClaimedGame.status)
+            )).all()
         waiting = [(r.id, r.title, r.code, r.extra) for r in rows
                    if is_waiting_steam_key(r.status, r.code, r.extra)]
+        # A waiting key whose title another row already settled - the key
+        # activated, or posted as a duplicate, under a different game id -
+        # is the same key again, not a new one: it leaves the queue as
+        # existed, unactivated and unposted, however it got saved again.
+        already_handled = [w for w in waiting if has_terminal_sibling(w[0], w[1], standings)]
+        waiting = [w for w in waiting if not has_terminal_sibling(w[0], w[1], standings)]
+        for row_id, title, _key, _extra in already_handled:
+            await self._settle_already_handled(row_id, title)
         if not waiting:
             logger.debug("No Steam keys waiting to be activated.")
             return
@@ -450,6 +481,26 @@ class SteamClaimer(BaseClaimer):
         from src.core.database import ClaimedGame
 
         logger.info("'%s' is already in your Steam library; its key is left unactivated.", title)
+        async with async_session() as session:
+            row = await session.get(ClaimedGame, row_id)
+            if row:
+                row.status = "existed"
+                await session.commit()
+        self.notify_games.append({"title": title, "url": URL_REGISTER_KEY, "status": "existed"})
+
+    async def _settle_already_handled(self, row_id: int, title: str) -> None:
+        """Set one waiting key aside because its title was already handled.
+
+        Another row for the same title - under a different game id, from
+        before the source's ids changed - already activated this key or
+        posted it as a duplicate. The row leaves the queue as existed:
+        never activated, and never posted to the duplicates channel a
+        second time.
+        """
+        from src.core.database import ClaimedGame
+
+        logger.info("'%s' was already handled under another entry, so its key is set aside "
+                    "and will not be posted as a duplicate.", title)
         async with async_session() as session:
             row = await session.get(ClaimedGame, row_id)
             if row:

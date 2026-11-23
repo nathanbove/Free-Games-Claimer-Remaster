@@ -40,7 +40,10 @@ browser:
      revealed outside the bot, by you on the site, was never the bot's to
      queue. A row the bot made earlier without the key in it (the reveal
      was recorded, the key itself was not) does get the key saved, so the
-     key takes its place in the queue like any other. An unrevealed key is
+     key takes its place in the queue like any other - unless the title
+     was already settled under a different game id (its key activated, or
+     posted as a duplicate), in which case the key is recorded without
+     being queued a second time. An unrevealed key is
      revealed by pressing its Reveal button and reading the key the page
      shows afterwards; a keyless grant is recorded as claimed with no key.
 
@@ -383,13 +386,15 @@ def choice_groups(links: list) -> list[dict]:
 def select_month(current_slug: str | None, groups: list) -> tuple[dict | None, bool]:
     """Pick the month a run works: (the group, whether the current month is unpaid).
 
-    The current month wins when it is in the library; when it is not, it is
-    posted but not paid for, and the newest month the library does hold is
-    worked instead. With no current month read, the newest group is the
-    pick and nothing is unpaid. No groups at all picks nothing.
+    The current month wins when it is in the library; when a read that did
+    find Choice months does not hold it, it is posted but not paid for, and
+    the newest month the library does hold is worked instead. With no
+    current month read, the newest group is the pick and nothing is
+    unpaid. No groups at all is no evidence either way - an empty read
+    proves nothing - so it picks nothing and calls nothing unpaid.
     """
     if not groups:
-        return None, bool(current_slug)
+        return None, False
     if current_slug:
         for group in groups:
             if group["slug"] == current_slug:
@@ -738,18 +743,26 @@ class HumbleClaimer(BaseClaimer):
 
         The membership home names the current month; the library's first
         page names the months you own. The current month is the pick when
-        it is owned; a current month that is not owned is alerted as
-        unpaid, and the newest owned month is the pick instead.
+        it is owned; a current month that a real library read does not
+        hold is alerted as unpaid, and the newest owned month is the pick
+        instead. A library read that finds no months at all proves
+        nothing - the page may not have settled yet - so it is read once
+        more, and if it still finds nothing the run works no month and
+        makes no unpaid call.
         """
         await self.page.get(URL_MEMBERSHIP)
         await self.sleep(5)
         current_slug = parse_month_heading(await self._page_text())
         if current_slug is None:
             logger.debug("The membership page named no current Choice month.")
-        await self.page.get(URL_LIBRARY)
-        await self.sleep(5)
-        links = await self._eval_json(LIBRARY_LINKS_JS, [])
-        groups = choice_groups(links if isinstance(links, list) else [])
+        groups = await self._library_groups()
+        if not groups:
+            logger.debug("The library read found no Choice months; reading the library once more.")
+            groups = await self._library_groups()
+        if not groups:
+            logger.warning("The library page named no Choice months on either read, "
+                           "so no month is worked and no unpaid call is made this run.")
+            return None
         group, unpaid = select_month(current_slug, groups)
         if unpaid and current_slug:
             await self._alert_unpaid(current_slug)
@@ -758,6 +771,22 @@ class HumbleClaimer(BaseClaimer):
         logger.info("Working on '%s', the newest Choice month in your library.",
                     month_display_name(group["slug"]))
         return group
+
+    async def _library_groups(self) -> list:
+        """The Choice months the library's first page names, newest first.
+
+        What the read found is logged - how many links it handed back,
+        and the months they grouped into - so a later empty or partial
+        read can be told apart from a library that genuinely holds less.
+        """
+        await self.page.get(URL_LIBRARY)
+        await self.sleep(5)
+        links = await self._eval_json(LIBRARY_LINKS_JS, [])
+        links = links if isinstance(links, list) else []
+        groups = choice_groups(links)
+        logger.debug("The library read found %d link(s), in Choice month(s): %s.",
+                     len(links), [group["slug"] for group in groups] or "none")
+        return groups
 
     async def _order_url(self, group: dict) -> str | None:
         """The month's order page, by way of its first game's details dialog.
@@ -807,6 +836,35 @@ class HumbleClaimer(BaseClaimer):
         if row is None:
             return None
         return row.status, row.code
+
+    async def _title_already_handled(self, title: str, game_id: str) -> bool:
+        """Whether this title was already settled under a different game id.
+
+        A title can stand in the database under more than one game id: the
+        id scheme changed with the rebuilt site, so a month first read by
+        older code keeps its old rows beside the new ones. A sibling row
+        that holds a key, or that ended claimed and activated or notified,
+        means the title's key was already worked - activated, or posted as
+        a duplicate. Saving the key again under this game id would queue
+        it a second time and post it as a duplicate a second time.
+        """
+        from sqlalchemy import or_, select
+
+        from src.core.database import ClaimedGame
+
+        async with async_session() as session:
+            result = await session.execute(
+                select(ClaimedGame.id).where(
+                    ClaimedGame.store == "humble",
+                    ClaimedGame.user == (self.user or "unknown"),
+                    ClaimedGame.title == title,
+                    ClaimedGame.game_id != game_id,
+                    or_(
+                        ClaimedGame.code.isnot(None),
+                        ClaimedGame.status.in_(("claimed and activated", "notified")),
+                    ),
+                ))
+            return result.first() is not None
 
     async def _remember(self, game_id: str, title: str, url: str, db_status: str,
                         key: str | None = None, platform: str = "",
@@ -869,6 +927,19 @@ class HumbleClaimer(BaseClaimer):
                 # The bot saved this key before: it keeps its row and its queue place.
                 await self._remember(entry["game_id"], title, order_url, "existed",
                                      overwrite=False)
+                self.notify_games.append({"title": title, "url": order_url, "status": "existed"})
+            elif row is not None and await self._title_already_handled(title, entry["game_id"]):
+                # The title was already settled under a different game id -
+                # its key activated, or posted as a duplicate - so this
+                # codeless row is the "revealed outside the bot" standing
+                # after all, not the Padrino shape below: a run that first
+                # reads a month under new game ids records every entry
+                # without its key, and saving those keys on the next run
+                # would queue them all a second time. Record it without
+                # the key, the same as the no-row branch below.
+                logger.info("'%s' was already handled under another entry, so its key is "
+                            "recorded without being queued again.", title)
+                await self._remember(entry["game_id"], title, order_url, "existed")
                 self.notify_games.append({"title": title, "url": order_url, "status": "existed"})
             elif row is not None:
                 # The Padrino shape: the reveal was recorded but the key

@@ -17,6 +17,8 @@ from src.stores.humble import (
     ORDER_ENTRIES_JS,
     REDEEM_LINK_JS,
     SIGNED_IN_JS,
+    URL_LIBRARY,
+    URL_MEMBERSHIP,
     HumbleClaimer,
     choice_groups,
     classify_entry,
@@ -243,13 +245,94 @@ class TestSelectMonth:
         assert group["slug"] == "november-2026"
         assert unpaid is False
 
-    def test_no_groups_picks_nothing(self):
+    def test_no_groups_picks_nothing_and_calls_nothing_unpaid(self):
+        # An empty library read is no evidence either way: the November
+        # 22, 2026 run read no groups from a page that had not settled
+        # and reported the paid November month as unpaid. Empty picks
+        # nothing, and flags nothing.
         group, unpaid = select_month("november-2026", [])
         assert group is None
-        assert unpaid is True
+        assert unpaid is False
         group, unpaid = select_month(None, [])
         assert group is None
         assert unpaid is False
+
+
+class TestPickMonth:
+    """A run's month is picked from two page reads, and an empty library read proves nothing.
+
+    The November 22, 2026 run: the library page handed back no links at
+    all - a read that raced the rebuilt page settling - and the empty
+    result was taken as proof the current month was unpaid, so a false
+    "posted but not paid for" alert went to the issues feed for November
+    2026, a month that was paid for and had been worked for days. An
+    empty read now earns one reread; two empty reads end the pick
+    quietly, with no month worked and no alert sent.
+    """
+
+    NOVEMBER_LINKS = [
+        _link("November 2026 Humble Choice", "Mafia: The Old Country", "/home/library/content/aaa"),
+    ]
+
+    def _claimer(self, reads, membership_text="November 2026 Humble Choice - Member Home"):
+        """A claimer whose library reads answer with each entry of `reads` in turn.
+
+        Returns (claimer, alerted): `alerted` collects the slugs handed
+        to _alert_unpaid, so a test can say whether the unpaid alert fired.
+        """
+        answers = list(reads)
+
+        class FakePage:
+            def __init__(self):
+                self.visits = []
+
+            async def get(self, url):
+                self.visits.append(url)
+                return None
+
+        async def _no_sleep(_seconds):
+            return None
+
+        async def _page_text():
+            return membership_text
+
+        async def _eval_json(_js, _fallback=None):
+            return answers.pop(0) if answers else []
+
+        alerted = []
+
+        async def _alert_unpaid(slug):
+            alerted.append(slug)
+
+        claimer = HumbleClaimer.__new__(HumbleClaimer)
+        claimer.page = FakePage()
+        claimer.sleep = _no_sleep
+        claimer._page_text = _page_text
+        claimer._eval_json = _eval_json
+        claimer._alert_unpaid = _alert_unpaid
+        return claimer, alerted
+
+    def test_an_empty_first_read_is_reread_and_the_month_picked(self):
+        claimer, alerted = self._claimer([[], self.NOVEMBER_LINKS])
+        group = asyncio.run(claimer._pick_month())
+        assert group["slug"] == "november-2026"
+        assert alerted == []
+        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY, URL_LIBRARY]
+
+    def test_two_empty_reads_work_no_month_and_send_no_alert(self):
+        claimer, alerted = self._claimer([[], []])
+        assert asyncio.run(claimer._pick_month()) is None
+        assert alerted == []
+        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY, URL_LIBRARY]
+
+    def test_a_current_month_the_library_does_not_hold_still_alerts(self):
+        claimer, alerted = self._claimer(
+            [self.NOVEMBER_LINKS],
+            membership_text="December 2026 Humble Choice - Member Home")
+        group = asyncio.run(claimer._pick_month())
+        assert group["slug"] == "november-2026"
+        assert alerted == ["december-2026"]
+        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY]
 
 
 class TestOrderUrl:
@@ -299,3 +382,88 @@ class TestOrderUrl:
         claimer = self._claimer(None)
         group = {"games": [{"title": "A Game", "href": "/home/library/content/aaa"}]}
         assert asyncio.run(claimer._order_url(group)) is None
+
+
+class TestRevealedKeyAlreadyHandled:
+    """A revealed key whose title was already settled under another game id is not queued again.
+
+    The November 2026 incident: the rebuilt site's new game ids meant the
+    first run under them recorded every November entry as existed, without
+    its key - the "revealed outside the bot" standing. On the next run
+    those codeless rows took the Padrino branch below and every key was
+    saved as claimed, so the Steam queue posted all ten November keys to
+    the duplicates channel: the games were already activated, or already
+    posted, and DYSMANTLE went up twice. The two standings contradict each
+    other across runs unless the Padrino save first checks whether a
+    sibling row already settled the title.
+    """
+
+    ORDER_URL = "https://www.humblebundle.com/home/library/order-uuid"
+    GAME_ID = "order-uuid/squeakross-home-squeak-home"
+    OLD_GAME_ID = "november-2026/squeakross-home-squeak-home"
+    TITLE = "Squeakross: Home Squeak Home"
+    KEY = "ABCDE-12345-FGHIJ"
+
+    def _row(self, game_id, status, code=None):
+        from src.core.database import ClaimedGame
+        return ClaimedGame(store="humble", user="tester", game_id=game_id, title=self.TITLE,
+                           url=self.ORDER_URL, status=status, code=code)
+
+    def _settle(self, tmp_path, monkeypatch, rows):
+        """Seed the rows, settle the revealed entry against them, and read the table back."""
+        import src.stores.humble as humble
+        from sqlalchemy import select
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from src.core.database import Base, ClaimedGame
+
+        async def run():
+            engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'fgc.db'}")
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            factory = async_sessionmaker(engine, expire_on_commit=False)
+            monkeypatch.setattr(humble, "async_session", factory)
+            async with factory() as session:
+                session.add_all(rows)
+                await session.commit()
+            claimer = HumbleClaimer.__new__(HumbleClaimer)
+            claimer.user, claimer.notify_games = "tester", []
+            entry = classify_entry(_revealed_steam(), today=TODAY)
+            entry["game_id"] = self.GAME_ID
+            standing = await claimer._claim_entry(entry, self.ORDER_URL)
+            async with factory() as session:
+                saved = {r.game_id: r for r in (await session.execute(select(ClaimedGame))).scalars()}
+            await engine.dispose()
+            return standing, claimer.notify_games, saved
+
+        return asyncio.run(run())
+
+    def test_a_key_activated_under_another_id_is_not_saved_again(self, tmp_path, monkeypatch):
+        standing, notify, saved = self._settle(tmp_path, monkeypatch, [
+            self._row(self.GAME_ID, "existed"),
+            self._row(self.OLD_GAME_ID, "claimed and activated", code="ZZZZZ-99999-YYYYY"),
+        ])
+        assert standing == "settled"
+        assert saved[self.GAME_ID].status == "existed" and saved[self.GAME_ID].code is None
+        assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "existed"}]
+
+    def test_a_key_posted_as_a_duplicate_is_not_saved_again(self, tmp_path, monkeypatch):
+        # The DYSMANTLE shape: the sibling row is the duplicate posting itself.
+        standing, notify, saved = self._settle(tmp_path, monkeypatch, [
+            self._row(self.GAME_ID, "existed"),
+            self._row(self.OLD_GAME_ID, "notified", code="ZZZZZ-99999-YYYYY"),
+        ])
+        assert standing == "settled"
+        assert saved[self.GAME_ID].status == "existed" and saved[self.GAME_ID].code is None
+        assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "existed"}]
+
+    def test_a_key_with_no_sibling_is_saved_and_queued(self, tmp_path, monkeypatch):
+        # The Padrino shape, unchanged: the reveal was recorded without the
+        # key, and no other row ever settled the title, so the key is saved.
+        standing, notify, saved = self._settle(tmp_path, monkeypatch, [
+            self._row(self.GAME_ID, "existed"),
+        ])
+        assert standing == "settled"
+        assert saved[self.GAME_ID].status == "claimed" and saved[self.GAME_ID].code == self.KEY
+        assert json.loads(saved[self.GAME_ID].extra)["external_store"] == "steam"
+        assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "claimed"}]
