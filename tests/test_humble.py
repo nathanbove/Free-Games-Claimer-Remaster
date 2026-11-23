@@ -10,12 +10,15 @@ import asyncio
 import json
 from datetime import date
 
+import pytest
+
 from src.stores.humble import (
     AUTH_FORM_JS,
     CONTENT_ENTRY_JS,
     LIBRARY_LINKS_JS,
     ORDER_ENTRIES_JS,
     REDEEM_LINK_JS,
+    SHOWCASE_JS,
     SIGNED_IN_JS,
     URL_LIBRARY,
     URL_MEMBERSHIP,
@@ -28,7 +31,7 @@ from src.stores.humble import (
     month_slug_from_text,
     normalize_platform,
     parse_month_heading,
-    select_month,
+    parse_showcase,
     title_slug,
 )
 
@@ -243,72 +246,84 @@ class TestChoiceGroups:
             "Mafia: The Old Country - Padrino Pack"]
 
 
-class TestSelectMonth:
-    def _groups(self):
-        return choice_groups([
-            _link("November 2026 Humble Choice", "Mafia: The Old Country", "/home/library/content/aaa"),
-            _link("October 2026 Humble Choice", "Row Game", "/home/library/content/ccc"),
-        ])
+class TestShowcase:
+    def test_a_label_and_its_buttons_speak(self):
+        showcase = parse_showcase({"label": "November 2026 Humble Choice",
+                                   "titles": ["Mafia: The Old Country", "DYSMANTLE"]})
+        assert showcase == {"slug": "november-2026",
+                            "titles": ["Mafia: The Old Country", "DYSMANTLE"]}
 
-    def test_the_current_month_wins_when_owned(self):
-        group, unpaid = select_month("november-2026", self._groups())
-        assert group["slug"] == "november-2026"
-        assert unpaid is False
+    def test_titles_are_cleaned_and_kept_once(self):
+        showcase = parse_showcase({"label": "November 2026 Humble Choice",
+                                   "titles": [" DYSMANTLE ", "DYSMANTLE", "", None]})
+        assert showcase["titles"] == ["DYSMANTLE"]
 
-    def test_an_unowned_current_month_falls_back_and_reports_unpaid(self):
-        group, unpaid = select_month("december-2026", self._groups())
-        assert group["slug"] == "november-2026"
-        assert unpaid is True
+    def test_no_strip_is_no_showcase(self):
+        assert parse_showcase({"label": "", "titles": []}) is None
+        assert parse_showcase({}) is None
+        assert parse_showcase(None) is None
+        assert parse_showcase("November 2026 Humble Choice") is None
 
-    def test_no_current_month_read_picks_the_newest(self):
-        group, unpaid = select_month(None, self._groups())
-        assert group["slug"] == "november-2026"
-        assert unpaid is False
+    def test_a_label_that_names_no_choice_month_is_no_showcase(self):
+        assert parse_showcase({"label": "Deck the Halls with Deckbuilders",
+                               "titles": ["A Game"]}) is None
 
-    def test_no_groups_picks_nothing_and_calls_nothing_unpaid(self):
-        # An empty library read is no evidence either way: the November
-        # 22, 2026 run read no groups from a page that had not settled
-        # and reported the paid November month as unpaid. Empty picks
-        # nothing, and flags nothing.
-        group, unpaid = select_month("november-2026", [])
-        assert group is None
-        assert unpaid is False
-        group, unpaid = select_month(None, [])
-        assert group is None
-        assert unpaid is False
+    def test_a_label_with_no_buttons_behind_it_is_no_showcase(self):
+        assert parse_showcase({"label": "November 2026 Humble Choice", "titles": []}) is None
 
 
 class TestPickMonth:
-    """A run's month is picked from two page reads, and an empty library read proves nothing.
+    """A run's month is picked on the showcase's word first, the library scan's second.
 
-    The November 22, 2026 run: the library page handed back no links at
-    all - a read that raced the rebuilt page settling - and the empty
-    result was taken as proof the current month was unpaid, so a false
-    "posted but not paid for" alert went to the issues feed for November
-    2026, a month that was paid for and had been worked for days. An
-    empty read now earns one reread; two empty reads end the pick
-    quietly, with no month worked and no alert sent.
+    The evidence rules are the point, and they come from the November
+    22, 2026 run: an unsettled library page handed back nothing, the
+    empty read was taken as proof, and a false "posted but not paid for"
+    alert went out for a month that was paid for and had been worked for
+    days. So a reading that proves nothing concludes nothing. A showcase
+    naming the current month is positive evidence the month is yours -
+    a details dialog that then names no order page is a site problem,
+    and the run works no month and sends no alert. A scan naming no
+    month is likewise no evidence. The unpaid alert is earned only by a
+    scan that names an older month than the current one: the library
+    demonstrably holds Choice months, and the current one is not the
+    newest of them.
     """
 
-    NOVEMBER_LINKS = [
-        _link("November 2026 Humble Choice", "Mafia: The Old Country", "/home/library/content/aaa"),
-    ]
+    NOVEMBER_SHOWCASE = {"label": "November 2026 Humble Choice",
+                         "titles": ["Mafia: The Old Country", "DYSMANTLE"]}
+    ORDER_HREF = "/home/library/order-uuid"
+    ORDER_URL = "https://www.humblebundle.com/home/library/order-uuid"
 
-    def _claimer(self, reads, membership_text="November 2026 Humble Choice - Member Home"):
-        """A claimer whose library reads answer with each entry of `reads` in turn.
+    def _claimer(self, *, membership_text="November 2026 Humble Choice - Member Home",
+                 showcases=(), click_titles=(), redeem_href=ORDER_HREF, pages=None):
+        """A claimer whose pages answer from the script they are handed.
 
+        showcases: the readings successive showcase reads hand back, in
+        order; the last one stands when the queue runs out, the way a
+        settled page keeps answering. click_titles: the titles whose
+        details button opens its dialog. redeem_href: the href the open
+        dialog names, or None when it names none. pages: {page number:
+        links} for the scan's library reads, by the fake page's address.
         Returns (claimer, alerted): `alerted` collects the slugs handed
-        to _alert_unpaid, so a test can say whether the unpaid alert fired.
+        to _alert_unpaid, so a test can say whether the alert fired.
         """
-        answers = list(reads)
+        showcase_readings = list(showcases)
+        pages = pages or {}
 
         class FakePage:
             def __init__(self):
                 self.visits = []
+                self.current = ""
 
             async def get(self, url):
                 self.visits.append(url)
+                self.current = url
                 return None
+
+            async def evaluate(self, js, await_promise=False):
+                if "View details for" in js:
+                    return any(json.dumps(title) in js for title in click_titles)
+                return True  # the dialog dismiss
 
         async def _no_sleep(_seconds):
             return None
@@ -316,8 +331,18 @@ class TestPickMonth:
         async def _page_text():
             return membership_text
 
-        async def _eval_json(_js, _fallback=None):
-            return answers.pop(0) if answers else []
+        async def _eval_json(js, _fallback=None):
+            if "Go to Redeem" in js:
+                return redeem_href
+            if "TreeWalker" in js:
+                url = claimer.page.current
+                number = int(url.rsplit("?page=", 1)[1]) if "?page=" in url else 1
+                return pages.get(number, [])
+            if "aria-label" in js:
+                if len(showcase_readings) > 1:
+                    return showcase_readings.pop(0)
+                return showcase_readings[0] if showcase_readings else None
+            raise AssertionError(f"unexpected script: {js[:60]}")
 
         alerted = []
 
@@ -332,51 +357,83 @@ class TestPickMonth:
         claimer._alert_unpaid = _alert_unpaid
         return claimer, alerted
 
-    def test_an_empty_first_read_is_reread_and_the_month_picked(self):
-        claimer, alerted = self._claimer([[], self.NOVEMBER_LINKS])
+    def test_the_showcase_picks_the_current_month_with_its_order_page(self):
+        claimer, alerted = self._claimer(
+            showcases=[self.NOVEMBER_SHOWCASE], click_titles=["Mafia: The Old Country"])
         group = asyncio.run(claimer._pick_month())
         assert group["slug"] == "november-2026"
+        assert group["order_url"] == self.ORDER_URL
         assert alerted == []
-        # The reread walks on to page 2 to finish the month's games
-        # before the walk ends on a page with no links left to give.
-        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY, URL_LIBRARY,
-                                       URL_LIBRARY + "?page=2"]
+        # The membership read and one library load settle the whole pick:
+        # no scan, no walk.
+        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY]
 
-    def test_two_empty_reads_work_no_month_and_send_no_alert(self):
-        claimer, alerted = self._claimer([[], []])
+    def test_the_next_showcase_title_is_tried_when_the_first_opens_no_dialog(self):
+        claimer, alerted = self._claimer(
+            showcases=[self.NOVEMBER_SHOWCASE], click_titles=["DYSMANTLE"])
+        group = asyncio.run(claimer._pick_month())
+        assert group["slug"] == "november-2026"
+        assert group["order_url"] == self.ORDER_URL
+        assert alerted == []
+
+    def test_a_showcase_whose_dialog_names_no_order_page_concludes_nothing(self):
+        # The showcase is positive evidence the month is his; a dialog
+        # that names no order page after it is a site problem, so the
+        # pick is inconclusive - no month worked, no alert sent - even
+        # though the direct reading is taken twice before it is believed.
+        claimer, alerted = self._claimer(
+            showcases=[self.NOVEMBER_SHOWCASE], click_titles=["Mafia: The Old Country"],
+            redeem_href=None)
         assert asyncio.run(claimer._pick_month()) is None
         assert alerted == []
         assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY, URL_LIBRARY]
 
-    def test_a_month_behind_a_newer_bundle_is_still_picked(self):
-        # The library as it stands since November 22, 2026: the newest
-        # bundle's games fill the first page, and the month's own games
-        # follow across the next pages, named only by their bundle line.
-        deck = [_link("", "Doors of Insanity: ReOpened", "/home/library/content/d1",
-                      sub="Deck the Halls with Deckbuilders")]
-        november_a = [_link("", "Check In, Please Playtest", "/home/library/content/n1",
-                            sub="November 2026 Humble Choice")]
-        november_b = [_link("", "Mafia: The Old Country", "/home/library/content/n2",
-                            sub="November 2026 Humble Choice")]
-        other = [_link("", "An Older Game", "/home/library/content/o1",
-                       sub="Some Older Bundle")]
-        claimer, alerted = self._claimer([deck, november_a, november_b, other])
+    def test_a_showcase_that_speaks_only_on_the_second_reading_still_picks(self):
+        claimer, alerted = self._claimer(
+            showcases=[None, self.NOVEMBER_SHOWCASE], click_titles=["Mafia: The Old Country"])
         group = asyncio.run(claimer._pick_month())
         assert group["slug"] == "november-2026"
-        assert [g["title"] for g in group["games"]] == [
-            "Check In, Please Playtest", "Mafia: The Old Country"]
+        assert group["order_url"] == self.ORDER_URL
         assert alerted == []
 
-    def test_a_current_month_the_library_does_not_hold_still_alerts(self):
+    def test_no_showcase_and_an_older_month_in_the_library_alerts_and_falls_back(self):
+        deck = [_link("", "Doors of Insanity: ReOpened", "/home/library/content/d1",
+                      sub="Deck the Halls with Deckbuilders")]
+        october = [_link("", "Row Game", "/home/library/content/o1",
+                         sub="October 2026 Humble Choice")]
         claimer, alerted = self._claimer(
-            [self.NOVEMBER_LINKS],
-            membership_text="December 2026 Humble Choice - Member Home")
+            membership_text="December 2026 Humble Choice - Member Home",
+            showcases=[None], pages={1: deck, 2: october})
+        group = asyncio.run(claimer._pick_month())
+        assert group["slug"] == "october-2026"
+        assert "order_url" not in group
+        assert alerted == ["december-2026"]
+
+    def test_no_showcase_and_the_current_month_in_the_library_picks_it_quietly(self):
+        november = [_link("", "Mafia: The Old Country", "/home/library/content/n1",
+                          sub="November 2026 Humble Choice")]
+        claimer, alerted = self._claimer(showcases=[None], pages={1: november})
         group = asyncio.run(claimer._pick_month())
         assert group["slug"] == "november-2026"
-        assert alerted == ["december-2026"]
-        # December never turns up; the walk ends on the first page that
-        # hands back no links at all.
-        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY, URL_LIBRARY + "?page=2"]
+        assert "order_url" not in group
+        assert alerted == []
+
+    def test_a_library_that_names_no_month_concludes_nothing(self):
+        claimer, alerted = self._claimer(showcases=[None], pages={1: []})
+        assert asyncio.run(claimer._pick_month()) is None
+        assert alerted == []
+
+    def test_no_current_month_named_picks_the_newest_owned(self):
+        november = [_link("", "Mafia: The Old Country", "/home/library/content/n1",
+                          sub="November 2026 Humble Choice")]
+        claimer, alerted = self._claimer(
+            membership_text="Member Home", pages={1: november})
+        group = asyncio.run(claimer._pick_month())
+        assert group["slug"] == "november-2026"
+        assert alerted == []
+        # No current month named, so no showcase is read at all: the
+        # scan goes straight to the library's first page.
+        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY]
 
 
 def _newlib_link(title, bundle, href):
@@ -388,10 +445,10 @@ class TestLibraryGroupsWalk:
     """The library read walks the pagination until the wanted month is read whole.
 
     Since November 22, 2026 the library lists a few games to a page with
-    no bundle headings, so the current month - twelve games - sits
-    straddled across pages behind anything bought after it. Reading only
-    the first page, as the pick used to, finds the newest bundle's games
-    and no month at all.
+    no bundle headings, so a month - twelve games - sits straddled
+    across pages behind anything bought after it. The pick no longer
+    reads months this way; the walk remains for gathering the cards of
+    a month worked from its games' own pages, where every card counts.
     """
 
     DECK_PAGE = [
@@ -490,85 +547,96 @@ class TestLibraryGroupsWalk:
         assert len(claimer.page.visits) == 10
 
 
-class TestOrderUrl:
-    """The order page is reached through the details dialog's 'Go to Redeem' link.
+class TestPageReadings:
+    """Every reading _eval_json parses hands its answer back as JSON.
 
-    Every reading _eval_json parses hands its answer back as JSON. The
-    redeem link once did not, so the href the dialog named could never be
-    parsed ('Expecting value: line 1 column 1 (char 0)' in the run log)
-    and every run fell back to the games' own pages, where the entries
-    only the order page lists - a month's DLC packs - are invisible.
+    The redeem link once did not, so the href the details dialog named
+    could never be parsed ('Expecting value: line 1 column 1 (char 0)'
+    in the run log) and the order page stayed unreachable.
     """
 
     def test_every_page_reading_answers_as_json(self):
-        for js in (SIGNED_IN_JS, AUTH_FORM_JS, LIBRARY_LINKS_JS,
+        for js in (SIGNED_IN_JS, AUTH_FORM_JS, LIBRARY_LINKS_JS, SHOWCASE_JS,
                    REDEEM_LINK_JS, ORDER_ENTRIES_JS, CONTENT_ENTRY_JS):
             assert js.strip().startswith("JSON.stringify"), js[:60]
 
-    def _claimer(self, href):
-        class FakePage:
-            async def get(self, url):
-                return None
 
-            async def evaluate(self, js, await_promise=False):
-                if "View details for" in js:
-                    return True
-                if "Go to Redeem" in js:
-                    # A browser running a JSON.stringify script hands back
-                    # the quoted string, which is what _eval_json parses.
-                    return json.dumps(href)
-                raise AssertionError(f"unexpected script: {js[:60]}")
+class TestClaimMonth:
+    """A month is worked from its order page when the pick brought one, else from its games' pages.
 
-        async def _no_sleep(_seconds):
-            return None
+    The walk's remaining job is in here: a month worked from its games'
+    pages gets its cards read whole, from _library_groups - and a month
+    whose pick brought an order page never touches the walk at all.
+    """
 
+    ORDER_URL = "https://www.humblebundle.com/home/library/order-uuid"
+
+    def _claimer(self, *, order_entries=(), walked=()):
         claimer = HumbleClaimer.__new__(HumbleClaimer)
-        claimer.page = FakePage()
-        claimer.sleep = _no_sleep
-        return claimer
+        claimer.notify_games = []
+        calls = {"order": [], "content": [], "walk": 0, "settled": []}
 
-    def test_the_dialogs_link_becomes_the_order_url(self):
-        claimer = self._claimer("/home/library/order-uuid")
-        group = {"games": [{"title": "A Game", "href": "/home/library/content/aaa"}]}
-        url = asyncio.run(claimer._order_url(group))
-        assert url == "https://www.humblebundle.com/home/library/order-uuid"
+        async def _order_entries(url):
+            calls["order"].append(url)
+            return list(order_entries)
 
-    def test_a_dialog_with_no_link_falls_back(self):
-        claimer = self._claimer(None)
-        group = {"games": [{"title": "A Game", "href": "/home/library/content/aaa"}]}
-        assert asyncio.run(claimer._order_url(group)) is None
+        async def _content_entry(game):
+            calls["content"].append(game["title"])
+            return {"title": game["title"], "state": "revealed"}
 
-    def test_a_later_game_opens_the_dialog_when_the_first_has_no_button(self):
-        # The month's games as the library lists them can start with a
-        # DLC pack, which the library page's showcase has no details
-        # button for; the next game that does have one opens the dialog.
-        class FakePage:
-            async def get(self, url):
-                return None
+        async def _library_groups(_slug=None):
+            calls["walk"] += 1
+            return list(walked)
 
-            async def evaluate(self, js, await_promise=False):
-                if "View details for" in js:
-                    return "DLC Pack" not in js
-                if "Go to Redeem" in js:
-                    return json.dumps("/home/library/order-uuid")
-                raise AssertionError(f"unexpected script: {js[:60]}")
+        async def _claim_entry(entry, _url):
+            calls["settled"].append(entry["title"])
+            return "settled"
 
-        async def _no_sleep(_seconds):
-            return None
+        claimer._order_entries = _order_entries
+        claimer._content_entry = _content_entry
+        claimer._library_groups = _library_groups
+        claimer._claim_entry = _claim_entry
+        return claimer, calls
 
-        claimer = HumbleClaimer.__new__(HumbleClaimer)
-        claimer.page = FakePage()
-        claimer.sleep = _no_sleep
-        group = {"slug": "november-2026", "games": [
-            {"title": "A Game - DLC Pack", "href": "/home/library/content/aaa"},
-            {"title": "A Game", "href": "/home/library/content/bbb"},
-        ]}
-        url = asyncio.run(claimer._order_url(group))
-        assert url == "https://www.humblebundle.com/home/library/order-uuid"
+    def test_a_pick_with_an_order_page_is_read_from_it_alone(self):
+        entry = {"title": "A Game", "state": "revealed"}
+        claimer, calls = self._claimer(order_entries=[entry])
+        group = {"slug": "november-2026", "games": [], "order_url": self.ORDER_URL}
+        asyncio.run(claimer._claim_month(group))
+        assert calls["order"] == [self.ORDER_URL]
+        assert calls["walk"] == 0
+        assert calls["content"] == []
+        assert calls["settled"] == ["A Game"]
+
+    def test_a_pick_with_no_order_page_is_worked_from_its_cards_read_whole(self):
+        # The pick's own games are only the scan page's few; the cards
+        # the month is worked from are the walk's whole read.
+        walked = [{"slug": "october-2026", "heading": "October 2026 Humble Choice",
+                   "games": [{"title": "Row Game", "href": "/home/library/content/o1"},
+                             {"title": "Second Game", "href": "/home/library/content/o2"}]}]
+        claimer, calls = self._claimer(walked=walked)
+        group = {"slug": "october-2026",
+                 "games": [{"title": "Row Game", "href": "/home/library/content/o1"}]}
+        asyncio.run(claimer._claim_month(group))
+        assert calls["order"] == []
+        assert calls["walk"] == 1
+        assert calls["content"] == ["Row Game", "Second Game"]
+        assert calls["settled"] == ["Row Game", "Second Game"]
+
+    def test_an_order_page_that_reads_empty_falls_back_to_the_cards(self):
+        walked = [{"slug": "november-2026", "heading": "November 2026 Humble Choice",
+                   "games": [{"title": "A Game", "href": "/home/library/content/a1"}]}]
+        claimer, calls = self._claimer(order_entries=[], walked=walked)
+        group = {"slug": "november-2026", "games": [], "order_url": self.ORDER_URL}
+        asyncio.run(claimer._claim_month(group))
+        assert calls["order"] == [self.ORDER_URL]
+        assert calls["walk"] == 1
+        assert calls["content"] == ["A Game"]
+        assert calls["settled"] == ["A Game"]
 
 
 class TestRevealedKeyAlreadyHandled:
-    """A revealed key whose title was already settled under another game id is not queued again.
+    """A revealed key that already stands under another game id is not queued again.
 
     The November 2026 incident: the rebuilt site's new game ids meant the
     first run under them recorded every November entry as existed, without
@@ -577,8 +645,14 @@ class TestRevealedKeyAlreadyHandled:
     saved as claimed, so the Steam queue posted all ten November keys to
     the duplicates channel: the games were already activated, or already
     posted, and DYSMANTLE went up twice. The two standings contradict each
-    other across runs unless the Padrino save first checks whether a
-    sibling row already settled the title.
+    other across runs unless the Padrino save first checks whether the
+    key already stands under another id. Identity is the string, not the
+    title (Nathan's ruling): a sibling holding a different key settles
+    nothing - that key is a new key and is saved like any other.
+
+    No row at all is a different standing again: it means the key has
+    never been processed, so the tests below save it and hand it to its
+    store rather than treating an outside reveal as settled.
     """
 
     ORDER_URL = "https://www.humblebundle.com/home/library/order-uuid"
@@ -621,24 +695,33 @@ class TestRevealedKeyAlreadyHandled:
 
         return asyncio.run(run())
 
-    def test_a_key_activated_under_another_id_is_not_saved_again(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("sibling_status", ["claimed and activated", "notified"])
+    def test_the_same_key_under_another_id_is_not_saved_again(self, tmp_path, monkeypatch, sibling_status):
+        # The November 2026 shape: the sibling row holds the IDENTICAL
+        # string - activated from it, or posted as a duplicate from it
+        # (the DYSMANTLE shape). The entry adds nothing.
         standing, notify, saved = self._settle(tmp_path, monkeypatch, [
             self._row(self.GAME_ID, "existed"),
-            self._row(self.OLD_GAME_ID, "claimed and activated", code="ZZZZZ-99999-YYYYY"),
+            self._row(self.OLD_GAME_ID, sibling_status, code=self.KEY),
         ])
         assert standing == "settled"
         assert saved[self.GAME_ID].status == "existed" and saved[self.GAME_ID].code is None
         assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "existed"}]
 
-    def test_a_key_posted_as_a_duplicate_is_not_saved_again(self, tmp_path, monkeypatch):
-        # The DYSMANTLE shape: the sibling row is the duplicate posting itself.
+    @pytest.mark.parametrize("sibling_status", ["claimed and activated", "notified"])
+    def test_a_different_key_under_another_id_is_saved_and_queued(self, tmp_path, monkeypatch, sibling_status):
+        # Nathan's ruling: the sibling settled a DIFFERENT string for the
+        # same game, so this key is a new key - the Padrino save runs and
+        # it queues like any other, to be posted as a duplicate in its
+        # own right if the game is owned.
         standing, notify, saved = self._settle(tmp_path, monkeypatch, [
             self._row(self.GAME_ID, "existed"),
-            self._row(self.OLD_GAME_ID, "notified", code="ZZZZZ-99999-YYYYY"),
+            self._row(self.OLD_GAME_ID, sibling_status, code="ZZZZZ-99999-YYYYY"),
         ])
         assert standing == "settled"
-        assert saved[self.GAME_ID].status == "existed" and saved[self.GAME_ID].code is None
-        assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "existed"}]
+        assert saved[self.GAME_ID].status == "claimed" and saved[self.GAME_ID].code == self.KEY
+        assert json.loads(saved[self.GAME_ID].extra)["external_store"] == "steam"
+        assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "claimed"}]
 
     def test_a_key_with_no_sibling_is_saved_and_queued(self, tmp_path, monkeypatch):
         # The Padrino shape, unchanged: the reveal was recorded without the
@@ -650,3 +733,23 @@ class TestRevealedKeyAlreadyHandled:
         assert saved[self.GAME_ID].status == "claimed" and saved[self.GAME_ID].code == self.KEY
         assert json.loads(saved[self.GAME_ID].extra)["external_store"] == "steam"
         assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "claimed"}]
+
+    def test_a_revealed_key_with_no_row_is_saved_and_queued(self, tmp_path, monkeypatch):
+        # Nathan's ruling: no row at all means the key has never been
+        # processed. A reveal outside the bot can still be unclaimed, so
+        # the key is saved exactly like one the bot revealed itself.
+        standing, notify, saved = self._settle(tmp_path, monkeypatch, [])
+        assert standing == "settled"
+        assert saved[self.GAME_ID].status == "claimed" and saved[self.GAME_ID].code == self.KEY
+        assert json.loads(saved[self.GAME_ID].extra)["external_store"] == "steam"
+        assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "claimed"}]
+
+    def test_a_revealed_key_with_no_row_is_a_waiting_steam_key(self, tmp_path, monkeypatch):
+        # The saved row is a genuine handoff, not just a record: it
+        # satisfies the Steam queue's own waiting-key test, so the
+        # redeemer will work it and make the duplicate check.
+        from src.stores.steam import is_waiting_steam_key
+
+        _standing, _notify, saved = self._settle(tmp_path, monkeypatch, [])
+        row = saved[self.GAME_ID]
+        assert is_waiting_steam_key(row.status, row.code, row.extra) is True
