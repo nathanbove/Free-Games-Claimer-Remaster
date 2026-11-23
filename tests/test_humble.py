@@ -299,3 +299,88 @@ class TestOrderUrl:
         claimer = self._claimer(None)
         group = {"games": [{"title": "A Game", "href": "/home/library/content/aaa"}]}
         assert asyncio.run(claimer._order_url(group)) is None
+
+
+class TestRevealedKeyAlreadyHandled:
+    """A revealed key whose title was already settled under another game id is not queued again.
+
+    The November 2026 incident: the rebuilt site's new game ids meant the
+    first run under them recorded every November entry as existed, without
+    its key - the "revealed outside the bot" standing. On the next run
+    those codeless rows took the Padrino branch below and every key was
+    saved as claimed, so the Steam queue posted all ten November keys to
+    the duplicates channel: the games were already activated, or already
+    posted, and DYSMANTLE went up twice. The two standings contradict each
+    other across runs unless the Padrino save first checks whether a
+    sibling row already settled the title.
+    """
+
+    ORDER_URL = "https://www.humblebundle.com/home/library/order-uuid"
+    GAME_ID = "order-uuid/squeakross-home-squeak-home"
+    OLD_GAME_ID = "november-2026/squeakross-home-squeak-home"
+    TITLE = "Squeakross: Home Squeak Home"
+    KEY = "ABCDE-12345-FGHIJ"
+
+    def _row(self, game_id, status, code=None):
+        from src.core.database import ClaimedGame
+        return ClaimedGame(store="humble", user="tester", game_id=game_id, title=self.TITLE,
+                           url=self.ORDER_URL, status=status, code=code)
+
+    def _settle(self, tmp_path, monkeypatch, rows):
+        """Seed the rows, settle the revealed entry against them, and read the table back."""
+        import src.stores.humble as humble
+        from sqlalchemy import select
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from src.core.database import Base, ClaimedGame
+
+        async def run():
+            engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'fgc.db'}")
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            factory = async_sessionmaker(engine, expire_on_commit=False)
+            monkeypatch.setattr(humble, "async_session", factory)
+            async with factory() as session:
+                session.add_all(rows)
+                await session.commit()
+            claimer = HumbleClaimer.__new__(HumbleClaimer)
+            claimer.user, claimer.notify_games = "tester", []
+            entry = classify_entry(_revealed_steam(), today=TODAY)
+            entry["game_id"] = self.GAME_ID
+            standing = await claimer._claim_entry(entry, self.ORDER_URL)
+            async with factory() as session:
+                saved = {r.game_id: r for r in (await session.execute(select(ClaimedGame))).scalars()}
+            await engine.dispose()
+            return standing, claimer.notify_games, saved
+
+        return asyncio.run(run())
+
+    def test_a_key_activated_under_another_id_is_not_saved_again(self, tmp_path, monkeypatch):
+        standing, notify, saved = self._settle(tmp_path, monkeypatch, [
+            self._row(self.GAME_ID, "existed"),
+            self._row(self.OLD_GAME_ID, "claimed and activated", code="ZZZZZ-99999-YYYYY"),
+        ])
+        assert standing == "settled"
+        assert saved[self.GAME_ID].status == "existed" and saved[self.GAME_ID].code is None
+        assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "existed"}]
+
+    def test_a_key_posted_as_a_duplicate_is_not_saved_again(self, tmp_path, monkeypatch):
+        # The DYSMANTLE shape: the sibling row is the duplicate posting itself.
+        standing, notify, saved = self._settle(tmp_path, monkeypatch, [
+            self._row(self.GAME_ID, "existed"),
+            self._row(self.OLD_GAME_ID, "notified", code="ZZZZZ-99999-YYYYY"),
+        ])
+        assert standing == "settled"
+        assert saved[self.GAME_ID].status == "existed" and saved[self.GAME_ID].code is None
+        assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "existed"}]
+
+    def test_a_key_with_no_sibling_is_saved_and_queued(self, tmp_path, monkeypatch):
+        # The Padrino shape, unchanged: the reveal was recorded without the
+        # key, and no other row ever settled the title, so the key is saved.
+        standing, notify, saved = self._settle(tmp_path, monkeypatch, [
+            self._row(self.GAME_ID, "existed"),
+        ])
+        assert standing == "settled"
+        assert saved[self.GAME_ID].status == "claimed" and saved[self.GAME_ID].code == self.KEY
+        assert json.loads(saved[self.GAME_ID].extra)["external_store"] == "steam"
+        assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "claimed"}]

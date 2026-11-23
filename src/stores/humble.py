@@ -40,7 +40,10 @@ browser:
      revealed outside the bot, by you on the site, was never the bot's to
      queue. A row the bot made earlier without the key in it (the reveal
      was recorded, the key itself was not) does get the key saved, so the
-     key takes its place in the queue like any other. An unrevealed key is
+     key takes its place in the queue like any other - unless the title
+     was already settled under a different game id (its key activated, or
+     posted as a duplicate), in which case the key is recorded without
+     being queued a second time. An unrevealed key is
      revealed by pressing its Reveal button and reading the key the page
      shows afterwards; a keyless grant is recorded as claimed with no key.
 
@@ -808,6 +811,35 @@ class HumbleClaimer(BaseClaimer):
             return None
         return row.status, row.code
 
+    async def _title_already_handled(self, title: str, game_id: str) -> bool:
+        """Whether this title was already settled under a different game id.
+
+        A title can stand in the database under more than one game id: the
+        id scheme changed with the rebuilt site, so a month first read by
+        older code keeps its old rows beside the new ones. A sibling row
+        that holds a key, or that ended claimed and activated or notified,
+        means the title's key was already worked - activated, or posted as
+        a duplicate. Saving the key again under this game id would queue
+        it a second time and post it as a duplicate a second time.
+        """
+        from sqlalchemy import or_, select
+
+        from src.core.database import ClaimedGame
+
+        async with async_session() as session:
+            result = await session.execute(
+                select(ClaimedGame.id).where(
+                    ClaimedGame.store == "humble",
+                    ClaimedGame.user == (self.user or "unknown"),
+                    ClaimedGame.title == title,
+                    ClaimedGame.game_id != game_id,
+                    or_(
+                        ClaimedGame.code.isnot(None),
+                        ClaimedGame.status.in_(("claimed and activated", "notified")),
+                    ),
+                ))
+            return result.first() is not None
+
     async def _remember(self, game_id: str, title: str, url: str, db_status: str,
                         key: str | None = None, platform: str = "",
                         overwrite: bool = True) -> None:
@@ -869,6 +901,19 @@ class HumbleClaimer(BaseClaimer):
                 # The bot saved this key before: it keeps its row and its queue place.
                 await self._remember(entry["game_id"], title, order_url, "existed",
                                      overwrite=False)
+                self.notify_games.append({"title": title, "url": order_url, "status": "existed"})
+            elif row is not None and await self._title_already_handled(title, entry["game_id"]):
+                # The title was already settled under a different game id -
+                # its key activated, or posted as a duplicate - so this
+                # codeless row is the "revealed outside the bot" standing
+                # after all, not the Padrino shape below: a run that first
+                # reads a month under new game ids records every entry
+                # without its key, and saving those keys on the next run
+                # would queue them all a second time. Record it without
+                # the key, the same as the no-row branch below.
+                logger.info("'%s' was already handled under another entry, so its key is "
+                            "recorded without being queued again.", title)
+                await self._remember(entry["game_id"], title, order_url, "existed")
                 self.notify_games.append({"title": title, "url": order_url, "status": "existed"})
             elif row is not None:
                 # The Padrino shape: the reveal was recorded but the key
