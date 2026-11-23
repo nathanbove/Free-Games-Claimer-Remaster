@@ -17,6 +17,8 @@ from src.stores.humble import (
     ORDER_ENTRIES_JS,
     REDEEM_LINK_JS,
     SIGNED_IN_JS,
+    URL_LIBRARY,
+    URL_MEMBERSHIP,
     HumbleClaimer,
     choice_groups,
     classify_entry,
@@ -243,13 +245,94 @@ class TestSelectMonth:
         assert group["slug"] == "november-2026"
         assert unpaid is False
 
-    def test_no_groups_picks_nothing(self):
+    def test_no_groups_picks_nothing_and_calls_nothing_unpaid(self):
+        # An empty library read is no evidence either way: the November
+        # 22, 2026 run read no groups from a page that had not settled
+        # and reported the paid November month as unpaid. Empty picks
+        # nothing, and flags nothing.
         group, unpaid = select_month("november-2026", [])
         assert group is None
-        assert unpaid is True
+        assert unpaid is False
         group, unpaid = select_month(None, [])
         assert group is None
         assert unpaid is False
+
+
+class TestPickMonth:
+    """A run's month is picked from two page reads, and an empty library read proves nothing.
+
+    The November 22, 2026 run: the library page handed back no links at
+    all - a read that raced the rebuilt page settling - and the empty
+    result was taken as proof the current month was unpaid, so a false
+    "posted but not paid for" alert went to the issues feed for November
+    2026, a month that was paid for and had been worked for days. An
+    empty read now earns one reread; two empty reads end the pick
+    quietly, with no month worked and no alert sent.
+    """
+
+    NOVEMBER_LINKS = [
+        _link("November 2026 Humble Choice", "Mafia: The Old Country", "/home/library/content/aaa"),
+    ]
+
+    def _claimer(self, reads, membership_text="November 2026 Humble Choice - Member Home"):
+        """A claimer whose library reads answer with each entry of `reads` in turn.
+
+        Returns (claimer, alerted): `alerted` collects the slugs handed
+        to _alert_unpaid, so a test can say whether the unpaid alert fired.
+        """
+        answers = list(reads)
+
+        class FakePage:
+            def __init__(self):
+                self.visits = []
+
+            async def get(self, url):
+                self.visits.append(url)
+                return None
+
+        async def _no_sleep(_seconds):
+            return None
+
+        async def _page_text():
+            return membership_text
+
+        async def _eval_json(_js, _fallback=None):
+            return answers.pop(0) if answers else []
+
+        alerted = []
+
+        async def _alert_unpaid(slug):
+            alerted.append(slug)
+
+        claimer = HumbleClaimer.__new__(HumbleClaimer)
+        claimer.page = FakePage()
+        claimer.sleep = _no_sleep
+        claimer._page_text = _page_text
+        claimer._eval_json = _eval_json
+        claimer._alert_unpaid = _alert_unpaid
+        return claimer, alerted
+
+    def test_an_empty_first_read_is_reread_and_the_month_picked(self):
+        claimer, alerted = self._claimer([[], self.NOVEMBER_LINKS])
+        group = asyncio.run(claimer._pick_month())
+        assert group["slug"] == "november-2026"
+        assert alerted == []
+        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY, URL_LIBRARY]
+
+    def test_two_empty_reads_work_no_month_and_send_no_alert(self):
+        claimer, alerted = self._claimer([[], []])
+        assert asyncio.run(claimer._pick_month()) is None
+        assert alerted == []
+        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY, URL_LIBRARY]
+
+    def test_a_current_month_the_library_does_not_hold_still_alerts(self):
+        claimer, alerted = self._claimer(
+            [self.NOVEMBER_LINKS],
+            membership_text="December 2026 Humble Choice - Member Home")
+        group = asyncio.run(claimer._pick_month())
+        assert group["slug"] == "november-2026"
+        assert alerted == ["december-2026"]
+        assert claimer.page.visits == [URL_MEMBERSHIP, URL_LIBRARY]
 
 
 class TestOrderUrl:
