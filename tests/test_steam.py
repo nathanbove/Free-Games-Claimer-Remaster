@@ -9,8 +9,8 @@ import pytest
 
 from src.stores.steam import (DEMO_JS, GAMES_ONLY, KEY_OUTCOMES, REMEMBER_ME_JS, REMEMBER_ME_STATE_JS, STORE_FREE_SEARCH,
                               SteamClaimer, activation_outcome, base_game_button_js, claim_order, free_search_games,
-                              has_terminal_sibling, is_waiting_steam_key, owned_app_ids, owned_verdicts, row_app_id,
-                              suggest_candidates, title_is_owned)
+                              is_waiting_steam_key, owned_app_ids, owned_verdicts, row_app_id,
+                              same_key_already_settled, suggest_candidates, title_is_owned)
 
 SOURCE = (Path(__file__).resolve().parent.parent / "src" / "stores" / "steam.py").read_text(encoding="utf-8")
 
@@ -543,14 +543,19 @@ class TestRowAppId:
 
 
 class TestWaitingKeyAlreadyHandled:
-    """A waiting key whose title another row already settled is never worked again.
+    """A waiting key is the same key again only when its string was already settled.
 
     Defense in depth behind the Humble fix: after that store's game ids
     changed, a run saved November 2026's already-handled keys as waiting
-    again, and the queue posted all ten to the duplicates channel,
-    DYSMANTLE twice. A waiting row with a sibling row that ended claimed
-    and activated or notified now leaves the queue as existed instead -
-    unactivated, and with nothing posted.
+    again - the identical strings - and the queue posted all ten to the
+    duplicates channel, DYSMANTLE twice. A waiting key whose identical
+    string another row already ended claimed and activated or notified
+    now leaves the queue as existed instead: unactivated, and with
+    nothing posted. But identity is the string, not the title (Nathan's
+    ruling): a different key for the same game is a new duplicate in its
+    own right and is posted again. And a given string is posted at most
+    once, on whichever path - the library verdict or Steam's own
+    already-owned answer - would post it.
     """
 
     STEAM_EXTRA = '{"external_store": "steam"}'
@@ -561,13 +566,20 @@ class TestWaitingKeyAlreadyHandled:
                            status=status, code=code, extra=self.STEAM_EXTRA if code else None)
 
     class _Queue:
-        """The redeemer's browser side, stubbed: signed in, the library speaks for no title, activations recorded."""
+        """The redeemer's browser side, stubbed: signed in, activations recorded.
+
+        The library speaks for the titles named in owned - those are the
+        ones already in the library - and for no other.
+        """
 
         _settle_already_handled = SteamClaimer._settle_already_handled
+        _divert_extra_key = SteamClaimer._divert_extra_key
+        _mark_duplicate = SteamClaimer._mark_duplicate
 
-        def __init__(self):
+        def __init__(self, owned=()):
             self.notify_games, self.activated = [], []
             self.page = self
+            self._owned = set(owned)
 
         async def start_browser(self, **kwargs):
             pass
@@ -585,13 +597,40 @@ class TestWaitingKeyAlreadyHandled:
             return True
 
         async def _library_verdicts(self, titles, app_ids=None):
-            return {}
+            return {title: True for title in self._owned}
 
         async def _activate_key(self, row_id, title, key):
             self.activated.append(title)
             return True
 
-    def _redeem(self, tmp_path, monkeypatch, rows):
+    class _RefusingQueue(_Queue):
+        """The queue with the real activation page, where Steam refuses the key as already owned.
+
+        The stub plays the page, the key field and the button; the
+        library check names nothing owned, so the key reaches the
+        activation page and Steam's own answer is the backstop.
+        """
+
+        _activate_key = SteamClaimer._activate_key
+
+        async def select(self, selector, timeout=None):
+            return self
+
+        async def click(self):
+            pass
+
+        async def send_keys(self, keys):
+            pass
+
+        async def evaluate(self, js, **kwargs):
+            if "error_display" in str(js):
+                return json.dumps({
+                    "error": "This Steam account already owns the product(s) contained in this offer.",
+                    "receipt": False,
+                })
+            return ""
+
+    def _redeem(self, tmp_path, monkeypatch, rows, owned=(), queue_cls=None):
         """Seed the rows, work the queue against them, and read the table back."""
         import src.core.notifier as notifier
         import src.stores.steam as steam
@@ -614,10 +653,11 @@ class TestWaitingKeyAlreadyHandled:
                 posted.append(message)
 
             monkeypatch.setattr(notifier, "notify_duplicates", record_duplicates)
+            monkeypatch.setattr(notifier, "duplicates_enabled", lambda: True)
             async with factory() as session:
                 session.add_all(rows)
                 await session.commit()
-            stub = self._Queue()
+            stub = (queue_cls or self._Queue)(owned)
             await SteamClaimer.redeem_pending_keys(stub)
             async with factory() as session:
                 saved = {r.game_id: r.status for r in (await session.execute(select(ClaimedGame))).scalars()}
@@ -626,31 +666,111 @@ class TestWaitingKeyAlreadyHandled:
 
         return asyncio.run(run())
 
-    def test_the_sibling_check_itself(self):
-        rows = [(1, "A Game", "claimed"), (2, "A Game", "notified"),
-                (3, "Other Game", "claimed and activated")]
-        assert has_terminal_sibling(1, "A Game", rows) is True
-        assert has_terminal_sibling(2, "A Game", rows) is False  # a row is not its own sibling
-        assert has_terminal_sibling(3, "Other Game", rows) is False  # its only terminal row is itself
-        assert has_terminal_sibling(9, "A Game", [(9, "A Game", "claimed")]) is False
+    def test_the_settled_check_itself(self):
+        rows = [(1, "A Game", "claimed", "KEY-1"), (2, "A Game", "notified", "KEY-1"),
+                (3, "Other Game", "claimed and activated", "KEY-2")]
+        assert same_key_already_settled(1, "KEY-1", rows) is True  # row 2 settled this string
+        assert same_key_already_settled(2, "KEY-1", rows) is False  # a row is not its own sibling
+        assert same_key_already_settled(3, "KEY-2", rows) is False  # its only terminal row is itself
+        assert same_key_already_settled(1, "KEY-9", rows) is False  # same title, a different string
+        assert same_key_already_settled(9, "KEY-1", [(9, "A Game", "claimed", "KEY-1")]) is False
 
     @pytest.mark.parametrize("sibling_status", ["claimed and activated", "notified"])
     def test_a_key_already_settled_under_another_row_is_set_aside(self, tmp_path, monkeypatch, sibling_status):
+        # The November 2026 shape: the sibling settled the IDENTICAL string.
         stub, posted, saved = self._redeem(tmp_path, monkeypatch, [
             self._row("order-uuid/dysmantle", "DYSMANTLE", "claimed", code="AAAAA-BBBBB-CCCCC"),
-            self._row("old/dysmantle", "DYSMANTLE", sibling_status, code="DDDDD-EEEEE-FFFFF"),
+            self._row("old/dysmantle", "DYSMANTLE", sibling_status, code="AAAAA-BBBBB-CCCCC"),
             self._row("order-uuid/fresh-game", "Fresh Game", "claimed", code="GGGGG-HHHHH-IIIII"),
         ])
         assert saved["order-uuid/dysmantle"] == "existed"
         assert stub.activated == ["Fresh Game"]
         assert posted == []
 
-    def test_a_waiting_key_with_no_terminal_sibling_is_activated(self, tmp_path, monkeypatch):
-        # The control: a second waiting row for the title settles nothing,
-        # so both keys are worked exactly as before.
+    def test_the_same_key_waiting_twice_is_worked_once(self, tmp_path, monkeypatch):
+        # Two waiting rows carrying one string: the first is worked, the
+        # twin is set aside - the same key is never posted twice, wherever
+        # the twin sits.
+        stub, posted, saved = self._redeem(tmp_path, monkeypatch, [
+            self._row("order-uuid/dysmantle", "DYSMANTLE", "claimed", code="AAAAA-BBBBB-CCCCC"),
+            self._row("old/dysmantle", "DYSMANTLE", "claimed", code="AAAAA-BBBBB-CCCCC"),
+        ])
+        assert stub.activated == ["DYSMANTLE"]
+        assert saved["old/dysmantle"] == "existed"
+        assert posted == []
+
+    @pytest.mark.parametrize("sibling_status", ["claimed and activated", "notified"])
+    def test_a_different_key_for_a_settled_title_is_posted_as_a_duplicate(self, tmp_path, monkeypatch, sibling_status):
+        # Nathan's ruling: a different string for a title a sibling already
+        # settled is a new duplicate - with the game owned, it is posted
+        # to the duplicates channel like any other spare.
+        stub, posted, saved = self._redeem(tmp_path, monkeypatch, [
+            self._row("order-uuid/dysmantle", "DYSMANTLE", "claimed", code="AAAAA-BBBBB-CCCCC"),
+            self._row("old/dysmantle", "DYSMANTLE", sibling_status, code="DDDDD-EEEEE-FFFFF"),
+        ], owned=("DYSMANTLE",))
+        assert saved["order-uuid/dysmantle"] == "notified"
+        assert stub.activated == []
+        assert len(posted) == 1 and "AAAAA-BBBBB-CCCCC" in posted[0]
+
+    def test_waiting_keys_with_no_settled_twin_are_activated(self, tmp_path, monkeypatch):
+        # The control: a second waiting row for the title, carrying a
+        # different string, settles nothing, so both keys are worked
+        # exactly as before.
         stub, posted, saved = self._redeem(tmp_path, monkeypatch, [
             self._row("order-uuid/fresh-game", "Fresh Game", "claimed", code="GGGGG-HHHHH-IIIII"),
             self._row("old/fresh-game", "Fresh Game", "claimed", code="JJJJJ-KKKKK-LLLLL"),
         ])
         assert stub.activated == ["Fresh Game", "Fresh Game"]
         assert posted == []
+
+    def test_the_same_key_waiting_twice_posts_once_when_owned(self, tmp_path, monkeypatch):
+        # Notify-once, the verdict path: the twin is set aside before
+        # the library verdict is applied, so one string carried by two
+        # waiting rows still produces exactly one post.
+        stub, posted, saved = self._redeem(tmp_path, monkeypatch, [
+            self._row("order-uuid/dysmantle", "DYSMANTLE", "claimed", code="AAAAA-BBBBB-CCCCC"),
+            self._row("old/dysmantle", "DYSMANTLE", "claimed", code="AAAAA-BBBBB-CCCCC"),
+        ], owned=("DYSMANTLE",))
+        assert len(posted) == 1 and "AAAAA-BBBBB-CCCCC" in posted[0]
+        assert saved["order-uuid/dysmantle"] == "notified"
+        assert saved["old/dysmantle"] == "existed"
+        assert stub.activated == []
+
+    def test_a_posted_key_is_never_posted_again(self, tmp_path, monkeypatch):
+        # Notify-once, across runs: the string already stands notified,
+        # so even with the game owned a fresh waiting row for it leaves
+        # quietly and the channel hears nothing.
+        stub, posted, saved = self._redeem(tmp_path, monkeypatch, [
+            self._row("order-uuid/dysmantle", "DYSMANTLE", "claimed", code="AAAAA-BBBBB-CCCCC"),
+            self._row("old/dysmantle", "DYSMANTLE", "notified", code="AAAAA-BBBBB-CCCCC"),
+        ], owned=("DYSMANTLE",))
+        assert posted == []
+        assert saved["order-uuid/dysmantle"] == "existed"
+        assert stub.activated == []
+
+    def test_an_owned_answer_at_activation_posts_a_shared_key_once(self, tmp_path, monkeypatch):
+        # Notify-once, the backstop path: the library check names
+        # nothing owned, Steam refuses the key as already owned at the
+        # activation page, and the identical twin behind it in the
+        # queue adds no second post.
+        stub, posted, saved = self._redeem(tmp_path, monkeypatch, [
+            self._row("order-uuid/dysmantle", "DYSMANTLE", "claimed", code="AAAAA-BBBBB-CCCCC"),
+            self._row("old/dysmantle", "DYSMANTLE", "claimed", code="AAAAA-BBBBB-CCCCC"),
+        ], queue_cls=self._RefusingQueue)
+        assert len(posted) == 1 and "AAAAA-BBBBB-CCCCC" in posted[0]
+        assert saved["order-uuid/dysmantle"] == "notified"
+        assert saved["old/dysmantle"] == "existed"
+
+    def test_two_different_keys_for_one_title_post_once_each(self, tmp_path, monkeypatch):
+        # Notify-once is per string, not per title: two different
+        # strings for one owned game are two spares, and each is posted
+        # exactly once, carrying its own string.
+        stub, posted, saved = self._redeem(tmp_path, monkeypatch, [
+            self._row("order-uuid/dysmantle", "DYSMANTLE", "claimed", code="AAAAA-BBBBB-CCCCC"),
+            self._row("old/dysmantle", "DYSMANTLE", "claimed", code="DDDDD-EEEEE-FFFFF"),
+        ], owned=("DYSMANTLE",))
+        assert len(posted) == 2
+        assert "AAAAA-BBBBB-CCCCC" in posted[0] and "DDDDD-EEEEE-FFFFF" in posted[1]
+        assert saved["order-uuid/dysmantle"] == "notified"
+        assert saved["old/dysmantle"] == "notified"
+        assert stub.activated == []

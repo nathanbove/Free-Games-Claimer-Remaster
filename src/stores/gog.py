@@ -527,9 +527,15 @@ class GOGClaimer(BaseClaimer):
     async def _divert_extra_key(self, g) -> None:
         """Post one spare GOG code to the duplicates channel instead of redeeming it.
 
-        The row is marked so the code is neither redeemed nor posted
-        twice: its status leaves the pending set, and the row remembers
-        the post for the force-redeem scan, which looks past the status.
+        The rows carrying the code are marked so the code is neither
+        redeemed nor posted twice: their status leaves the pending set,
+        and each row remembers the post for the force-redeem scan, which
+        looks past the status. The post itself is at-most-once per code:
+        the marking is committed before the post goes out, and when any
+        row with this code already remembers the post - a twin row for
+        the same code, settled earlier in this pass or in a previous
+        run, whose caller's snapshot predates the marking - the code is
+        settled the same way but never posted a second time.
         """
         from sqlalchemy import select
 
@@ -538,20 +544,29 @@ class GOGClaimer(BaseClaimer):
 
         logger.info("'%s' is already in your GOG library; its code goes to the extra keys channel.",
                     g.title)
+        already_posted = False
         async with async_session() as session:
-            obj = (await session.execute(
-                select(ClaimedGame).where(ClaimedGame.code == g.code))).scalars().first()
-            if obj:
+            objs = (await session.execute(
+                select(ClaimedGame).where(ClaimedGame.code == g.code))).scalars().all()
+            for obj in objs:
                 try:
                     extra = json.loads(obj.extra or "{}")
                     if not isinstance(extra, dict):
                         extra = {}
                 except (TypeError, ValueError):
                     extra = {}
+                if extra.get("extra_key_posted"):
+                    already_posted = True
                 extra["extra_key_posted"] = True
                 obj.extra = json.dumps(extra)
                 obj.status = "notified"
+            if objs:
                 await session.commit()
+        if already_posted:
+            logger.info("The spare code for '%s' was already posted to the extra keys "
+                        "channel, so it is not posted again.", g.title)
+            self.notify_games.append({"title": g.title, "url": g.url, "status": "existed"})
+            return
         await notify_duplicates(
             f"🎁 **{markdown_safe(g.title)}** - spare GOG code "
             f"(already in your library, from Prime Gaming)\n`{g.code}`")

@@ -172,19 +172,25 @@ def row_app_id(extra: str | None) -> int:
 TERMINAL_KEY_STATUSES = ("claimed and activated", "notified")
 
 
-def has_terminal_sibling(row_id: int, title: str, rows) -> bool:
-    """Whether another row for this title already settled a key for it.
+def same_key_already_settled(row_id: int, code: str | None, rows) -> bool:
+    """Whether another row already settled this very key.
 
-    rows is every row's (id, title, status). A title can stand in the
-    database under more than one row - a source whose game ids changed
-    (Humble's, with the rebuilt site) leaves the old row beside the new
-    one - and a key saved again as waiting under the new row is the same
-    key the old row already activated or posted as a duplicate. Working
-    it again would post that key as a duplicate a second time.
+    rows is every row's (id, title, status, code). A key is its string,
+    not its title: a game can stand in the database under more than one
+    row - a source whose game ids changed (Humble's, with the rebuilt
+    site) leaves the old row beside the new one - and the identical
+    string standing in another row that ended claimed and activated or
+    notified is the same key, already activated or already posted as a
+    duplicate. Working it again would post that key a second time. A
+    different string, even under the same title, is a different key: it
+    is worked like any other, and if its game is owned it is posted as
+    a duplicate in its own right.
     """
-    return any(other_id != row_id and other_title == title
+    if not code:
+        return False
+    return any(other_id != row_id and other_code == code
                and other_status in TERMINAL_KEY_STATUSES
-               for other_id, other_title, other_status in rows)
+               for other_id, _other_title, other_status, other_code in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -388,16 +394,27 @@ class SteamClaimer(BaseClaimer):
                 select(ClaimedGame).where(ClaimedGame.status == "claimed", ClaimedGame.code.isnot(None))
             )).scalars().all()
             standings = (await session.execute(
-                select(ClaimedGame.id, ClaimedGame.title, ClaimedGame.status)
+                select(ClaimedGame.id, ClaimedGame.title, ClaimedGame.status, ClaimedGame.code)
             )).all()
         waiting = [(r.id, r.title, r.code, r.extra) for r in rows
                    if is_waiting_steam_key(r.status, r.code, r.extra)]
-        # A waiting key whose title another row already settled - the key
-        # activated, or posted as a duplicate, under a different game id -
-        # is the same key again, not a new one: it leaves the queue as
-        # existed, unactivated and unposted, however it got saved again.
-        already_handled = [w for w in waiting if has_terminal_sibling(w[0], w[1], standings)]
-        waiting = [w for w in waiting if not has_terminal_sibling(w[0], w[1], standings)]
+        # A key is its string. A waiting key whose identical string
+        # another row already settled - activated, or posted as a
+        # duplicate, under a different game id - is the same key again,
+        # not a new one: it leaves the queue as existed, unactivated and
+        # unposted, however it got saved again. The same goes for an
+        # identical twin waiting ahead of it in this very queue: the
+        # string is worked once, never posted twice. A different string
+        # is a different key and flows on normally, even for a title a
+        # sibling row already settled.
+        already_handled, still_waiting, seen_codes = [], [], set()
+        for w in waiting:
+            if w[2] in seen_codes or same_key_already_settled(w[0], w[2], standings):
+                already_handled.append(w)
+            else:
+                seen_codes.add(w[2])
+                still_waiting.append(w)
+        waiting = still_waiting
         for row_id, title, _key, _extra in already_handled:
             await self._settle_already_handled(row_id, title)
         if not waiting:
@@ -489,17 +506,18 @@ class SteamClaimer(BaseClaimer):
         self.notify_games.append({"title": title, "url": URL_REGISTER_KEY, "status": "existed"})
 
     async def _settle_already_handled(self, row_id: int, title: str) -> None:
-        """Set one waiting key aside because its title was already handled.
+        """Set one waiting key aside because the same key was already settled.
 
-        Another row for the same title - under a different game id, from
-        before the source's ids changed - already activated this key or
-        posted it as a duplicate. The row leaves the queue as existed:
-        never activated, and never posted to the duplicates channel a
-        second time.
+        The identical key string already stands settled in another row -
+        under a different game id, from before the source's ids changed,
+        it was activated or posted as a duplicate - or an identical twin
+        waits ahead of it in this same queue. The row leaves the queue
+        as existed: never activated, and the same key is never posted
+        to the duplicates channel a second time.
         """
         from src.core.database import ClaimedGame
 
-        logger.info("'%s' was already handled under another entry, so its key is set aside "
+        logger.info("'%s' carries a key that was already settled, so it is set aside "
                     "and will not be posted as a duplicate.", title)
         async with async_session() as session:
             row = await session.get(ClaimedGame, row_id)

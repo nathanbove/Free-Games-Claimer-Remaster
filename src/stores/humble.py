@@ -19,31 +19,50 @@ browser:
      account asks its authenticator, or the code Humble e-mails, which only
      you can read, so that step is yours over VNC, like every other store.
   2. Find the one month to work on. The membership home names the current
-     month; your library's first page groups what you own, newest first.
-     The run works the current month when it is in your library, else the
-     newest month that is. When the current month is posted but not in
-     your library — subscription paused, month skipped, or billing failed —
-     the run says so on the issues feed, once per month, and works your
-     newest paid month instead. Only one month is worked per run: older
-     months are a back catalogue to settle by hand, not a sweep, and
-     pick-limited months from before February 2022 are never the newest
-     month any more, so they are left alone by the same rule.
-  3. Read the month's order page in your library. It lists every key of the
-     month, DLC packs included — more than the library's game cards show —
-     each entry in one of three states: revealed, with the key itself as a
-     button on the page; unrevealed, with a Reveal button and the date the
-     key must be revealed by; or a keyless grant already redeemed into a
-     linked account ("Redeemed on Blizzard (Battle.net)").
+     month, and the library's first page settles whether it is yours: the
+     page carries a showcase of the current month, a details button for
+     each of its games, and the dialog behind a button names the month's
+     order page — an order page the site will name is an order you hold —
+     so the current month is picked with its order page already in hand.
+     A showcase that names the current month but whose dialog names no
+     order page is a site problem, not an unpaid month: the showcase is
+     positive evidence the month is yours, so the run concludes nothing
+     and works no month. Only when the showcase will not speak for the
+     current month is the library scanned, newest first, for the newest
+     month it holds: the current month itself there is picked the same
+     way; an older month there means the current month is posted but not
+     in your library — subscription paused, month skipped, or billing
+     failed — so the run says so on the issues feed, once per month, and
+     works your newest paid month instead; and no month at all there
+     means the library read itself cannot be trusted, so nothing is
+     concluded. Only one month is worked per run: older months are a
+     back catalogue to settle by hand, not a sweep, and pick-limited
+     months from before February 2022 are never the newest month any
+     more, so they are left alone by the same rule.
+  3. Read the month's keys. The current month is read from its order page,
+     which lists every key of the month, DLC packs included — more than
+     the library's game cards show. An older month's order page is one
+     the new library names no way to reach, so an older month — and any
+     month whose order page cannot be read — is worked from its games'
+     own pages instead, and the run says so, because an entry only the
+     order page lists is invisible that way. However an entry is read, it
+     stands in one of three states: revealed, with the key itself as a
+     button on the page; unrevealed, with a Reveal button and the date
+     the key must be revealed by; or a keyless grant already redeemed
+     into a linked account ("Redeemed on Blizzard (Battle.net)").
   4. Settle each entry. A key that stands revealed is saved in the
-     database, tagged with the store it belongs to — unless the database
-     already holds that key, or holds no row at all for the game: a key
-     revealed outside the bot, by you on the site, was never the bot's to
-     queue. A row the bot made earlier without the key in it (the reveal
-     was recorded, the key itself was not) does get the key saved, so the
-     key takes its place in the queue like any other - unless the title
-     was already settled under a different game id (its key activated, or
-     posted as a duplicate), in which case the key is recorded without
-     being queued a second time. An unrevealed key is
+     database, tagged with the store it belongs to, so the store can
+     make its duplicate check. That includes a key with no row at
+     all: a reveal outside the bot can still be unclaimed, and no
+     row means the key has never been processed. A row the bot made
+     earlier without the key in it (the reveal was recorded, the key
+     itself was not) does get the key saved, so the key takes its
+     place in the queue like any other - unless the same key already
+     stands recorded under a different game id (queued, activated,
+     or posted as a duplicate from that row), in which case the key
+     is recorded without being queued a second time. A key is its
+     string: a different key for the same game is a new key, and
+     takes its place in the queue the same way. An unrevealed key is
      revealed by pressing its Reveal button and reading the key the page
      shows afterwards; a keyless grant is recorded as claimed with no key.
 
@@ -193,8 +212,9 @@ CLICK_SEND_CODE_JS = """
 # The library's game links, each with the bundle heading it sits under.
 # Headings are tracked in document order - a heading names the games that
 # follow it - because the cards' own markup does not say which bundle a
-# card belongs to; a link's own text does name its bundle, and is carried
-# along as the fallback grouping.
+# card belongs to; a link's own text does name its bundle, and on the
+# library as it stands now, with no bundle headings at all, that bundle
+# line is the grouping.
 LIBRARY_LINKS_JS = """
     JSON.stringify((() => {
         const month = /^(January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{4}/;
@@ -213,6 +233,31 @@ LIBRARY_LINKS_JS = """
             }
         }
         return links;
+    })())
+"""
+
+# The library page's current-month showcase: a strip on its first page,
+# labelled with the month ("November 2026 Humble Choice"), carrying a
+# details button for each of the month's games. Those buttons are the
+# only ones the page has - the game cards below are plain links to their
+# own pages - so the reading is the strip's label, taken from the text of
+# the smallest ancestor of the first button that names a Choice month,
+# and the titles its buttons carry.
+SHOWCASE_JS = """
+    JSON.stringify((() => {
+        const buttons = [...document.querySelectorAll('button')]
+            .filter(b => (b.getAttribute('aria-label') || '').startsWith('View details for '));
+        if (!buttons.length) return {label: '', titles: []};
+        const titles = buttons.map(b => b.getAttribute('aria-label').slice('View details for '.length).trim());
+        const month = /(January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{4}\\s+Humble Choice/;
+        let label = '';
+        let el = buttons[0];
+        for (let i = 0; i < 12 && el && !label; i++) {
+            const match = (el.innerText || '').match(month);
+            if (match) label = match[0];
+            el = el.parentElement;
+        }
+        return {label, titles};
     })())
 """
 
@@ -238,6 +283,20 @@ REDEEM_LINK_JS = """
                     && !(a.getAttribute('href') || '').includes('/content/'));
         return link ? link.getAttribute('href') : null;
     })())
+"""
+
+# Closing a details dialog that named no order page, so the next game's
+# button can be tried: the dialog's own close button where it has one,
+# else the key press a person would use.
+DISMISS_DIALOG_JS = """
+    (() => {
+        const button = [...document.querySelectorAll('button')]
+            .find(b => /^close$/i.test((b.getAttribute('aria-label') || '').trim())
+                    || /^close$/i.test((b.textContent || '').trim()));
+        if (button) { button.click(); return true; }
+        document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', bubbles: true}));
+        return false;
+    })()
 """
 
 # One key entry on an order page is a row with these classes; its title is
@@ -383,24 +442,27 @@ def choice_groups(links: list) -> list[dict]:
     return groups
 
 
-def select_month(current_slug: str | None, groups: list) -> tuple[dict | None, bool]:
-    """Pick the month a run works: (the group, whether the current month is unpaid).
+def parse_showcase(raw) -> dict | None:
+    """The library showcase's reading, as {slug, titles}, or None when it names no month.
 
-    The current month wins when it is in the library; when a read that did
-    find Choice months does not hold it, it is posted but not paid for, and
-    the newest month the library does hold is worked instead. With no
-    current month read, the newest group is the pick and nothing is
-    unpaid. No groups at all is no evidence either way - an empty read
-    proves nothing - so it picks nothing and calls nothing unpaid.
+    The showcase arrives as the strip's label ("November 2026 Humble
+    Choice") and the titles its details buttons carry. It speaks only
+    when the label names a Choice month and at least one button stands
+    behind it; anything else - no strip on the page, a label that names
+    no Choice month, a label with no buttons behind it - is no showcase
+    at all, and the run decides the month another way.
     """
-    if not groups:
-        return None, False
-    if current_slug:
-        for group in groups:
-            if group["slug"] == current_slug:
-                return group, False
-        return groups[0], True
-    return groups[0], False
+    if not isinstance(raw, dict):
+        return None
+    slug = parse_month_heading(str(raw.get("label") or ""))
+    titles: list[str] = []
+    for title in raw.get("titles") or []:
+        title = str(title or "").strip()
+        if title and title not in titles:
+            titles.append(title)
+    if not slug or not titles:
+        return None
+    return {"slug": slug, "titles": titles}
 
 
 # The words a button can carry that are not keys: the platform names an
@@ -741,79 +803,232 @@ class HumbleClaimer(BaseClaimer):
     async def _pick_month(self) -> dict | None:
         """The month this run works on, as {slug, heading, games}, or None.
 
-        The membership home names the current month; the library's first
-        page names the months you own. The current month is the pick when
-        it is owned; a current month that a real library read does not
-        hold is alerted as unpaid, and the newest owned month is the pick
-        instead. A library read that finds no months at all proves
-        nothing - the page may not have settled yet - so it is read once
-        more, and if it still finds nothing the run works no month and
-        makes no unpaid call.
+        A pick can carry the month's order page under "order_url": the
+        current month, settled by its showcase (see _direct_pick), is
+        read from there. Any other pick is worked from its games' own
+        pages, there being no order page to read for it.
+
+        The membership home names the current month. When it names one,
+        the showcase gets the first word; only a showcase that will not
+        speak for the current month sends the run to scan the library,
+        and the scan's answer then decides the unpaid call: the current
+        month itself in the library is picked with no call, an older
+        month is picked with the call made, and no month at all is no
+        evidence either way, so nothing is picked and nothing is called.
+        When the membership home names no current month, the newest
+        month the scan finds is the pick and nothing is unpaid - the
+        standing answer for a page that will not say.
         """
         await self.page.get(URL_MEMBERSHIP)
         await self.sleep(5)
         current_slug = parse_month_heading(await self._page_text())
         if current_slug is None:
             logger.debug("The membership page named no current Choice month.")
-        groups = await self._library_groups()
-        if not groups:
-            logger.debug("The library read found no Choice months; reading the library once more.")
-            groups = await self._library_groups()
-        if not groups:
-            logger.warning("The library page named no Choice months on either read, "
-                           "so no month is worked and no unpaid call is made this run.")
+            group = await self._scan_newest_month()
+            if group is None:
+                logger.warning("The library scan named no Choice month either, "
+                               "so no month is worked this run.")
+                return None
+            logger.info("Working on '%s', the newest Choice month in your library.",
+                        month_display_name(group["slug"]))
+            return group
+
+        outcome, group = await self._direct_pick(current_slug)
+        if outcome == "picked":
+            return group
+        if outcome == "inconclusive":
             return None
-        group, unpaid = select_month(current_slug, groups)
-        if unpaid and current_slug:
-            await self._alert_unpaid(current_slug)
+        group = await self._scan_newest_month()
         if group is None:
+            logger.warning("The library scan named no Choice month either, so no "
+                           "month is worked and no unpaid call is made this run.")
             return None
+        if group["slug"] == current_slug:
+            logger.info("The library holds '%s' after all - its showcase did not "
+                        "speak for it - so the current month is worked from its "
+                        "games' pages.", month_display_name(current_slug))
+            return group
+        await self._alert_unpaid(current_slug)
         logger.info("Working on '%s', the newest Choice month in your library.",
                     month_display_name(group["slug"]))
         return group
 
-    async def _library_groups(self) -> list:
-        """The Choice months the library's first page names, newest first.
+    async def _direct_pick(self, current_slug: str) -> tuple[str, dict | None]:
+        """Settle the current month from the library's showcase, when the showcase speaks.
 
-        What the read found is logged - how many links it handed back,
-        and the months they grouped into - so a later empty or partial
-        read can be told apart from a library that genuinely holds less.
+        The library's first page carries a showcase of the current
+        month: a strip labelled with the month, with a details button
+        for each of its games, and the dialog behind a button names the
+        month's order page. An order page the site will name is an order
+        you hold, so a named page picks the month outright, with no
+        library read beyond the one page. The reading is taken twice
+        before it is believed either way - the rebuilt page settles
+        slowly - and the two readings together answer one of three ways:
+
+        - "picked": the showcase named the current month and a dialog
+          named its order page; the group carries it under "order_url".
+        - "inconclusive": the showcase named the current month but no
+          dialog named an order page. The showcase is positive evidence
+          the month is yours, so a dead dialog is a site problem, not an
+          unpaid month: the caller works no month and makes no call.
+        - "no-showcase": the showcase was missing, or named another
+          month, on both readings. It said nothing about the current
+          month, so the caller scans the library for the newest month
+          it holds.
         """
-        await self.page.get(URL_LIBRARY)
-        await self.sleep(5)
-        links = await self._eval_json(LIBRARY_LINKS_JS, [])
-        links = links if isinstance(links, list) else []
-        groups = choice_groups(links)
-        logger.debug("The library read found %d link(s), in Choice month(s): %s.",
-                     len(links), [group["slug"] for group in groups] or "none")
-        return groups
+        saw_showcase = False
+        for _attempt in range(2):
+            await self.page.get(URL_LIBRARY)
+            await self.sleep(5)
+            showcase = parse_showcase(await self._eval_json(SHOWCASE_JS, None))
+            if showcase is None or showcase["slug"] != current_slug:
+                continue
+            saw_showcase = True
+            order_url = await self._showcase_order_url(showcase)
+            if order_url:
+                logger.info("The library's showcase names '%s', and a details dialog "
+                            "named its order page: the current month is in your "
+                            "library, picked with its order page in hand.",
+                            month_display_name(current_slug))
+                return "picked", {"slug": current_slug,
+                                  "heading": f"{month_display_name(current_slug)} Humble Choice",
+                                  "games": [], "order_url": order_url}
+        if saw_showcase:
+            logger.warning("The library's showcase names '%s' - the month is in your "
+                           "library - but its details dialog named no order page on "
+                           "either reading, so no month is worked this run and no "
+                           "unpaid call is made.", month_display_name(current_slug))
+            return "inconclusive", None
+        return "no-showcase", None
 
-    async def _order_url(self, group: dict) -> str | None:
-        """The month's order page, by way of its first game's details dialog.
+    async def _showcase_order_url(self, showcase: dict) -> str | None:
+        """The current month's order page, through its showcase's details dialog.
 
         The dialog's "Go to Redeem" link is the only way the site names
-        the order page; None when the dialog does not offer it, and the
-        caller falls back to the games' own pages.
+        the order page. The first few of the showcase's titles are
+        tried, each on the page load the showcase was read from - a
+        button can fail to open its dialog - and a dialog that names no
+        order page is dismissed before the next title is tried.
         """
-        if not group.get("games"):
-            return None
-        await self.page.get(URL_LIBRARY)
-        await self.sleep(5)
-        first = group["games"][0]
-        try:
-            clicked = await self.page.evaluate(CLICK_VIEW_DETAILS_JS % json.dumps(first["title"]))
-        except Exception as e:
-            logger.debug("Could not open the details for '%s': %s", first["title"], e)
-            clicked = False
-        if not clicked:
-            logger.debug("No details button for '%s' on the library page.", first["title"])
-            return None
-        await self.sleep(3)
-        href = await self._eval_json(REDEEM_LINK_JS, None)
-        if not href:
-            logger.debug("The details dialog named no order page.")
-            return None
-        return f"https://{SITE_HOST}{href}"
+        for title in showcase["titles"][:3]:
+            try:
+                clicked = await self.page.evaluate(CLICK_VIEW_DETAILS_JS % json.dumps(title))
+            except Exception as e:
+                logger.debug("Could not open the details for '%s': %s", title, e)
+                clicked = False
+            if not clicked:
+                logger.debug("No details button for '%s' on the library page.", title)
+                continue
+            await self.sleep(3)
+            href = await self._eval_json(REDEEM_LINK_JS, None)
+            if href:
+                return f"https://{SITE_HOST}{href}"
+            logger.debug("The details dialog for '%s' named no order page.", title)
+            try:
+                await self.page.evaluate(DISMISS_DIALOG_JS)
+            except Exception as e:
+                logger.debug("Could not dismiss the details dialog: %s", e)
+            await self.sleep(1)
+        return None
+
+    async def _scan_newest_month(self) -> dict | None:
+        """The newest Choice month the library holds, or None when the scan names none.
+
+        The library lists newest first, a few games to a page, so the
+        first page whose links group into any Choice month names the
+        newest month held: the scan stops there, and never reads a month
+        whole - the pick needs the month's name, not its cards. A page
+        with no links at all ends the scan (the library's end, or a page
+        that never settled), and a ten-page cap keeps a library that
+        never names a month from being scanned forever. What each page
+        found is logged, so a scan that named nothing can be told apart
+        from a library that genuinely holds less.
+        """
+        for page_number in range(1, 11):
+            url = URL_LIBRARY if page_number == 1 else f"{URL_LIBRARY}?page={page_number}"
+            await self.page.get(url)
+            await self.sleep(5)
+            links = await self._eval_json(LIBRARY_LINKS_JS, [])
+            links = links if isinstance(links, list) else []
+            if not links:
+                logger.debug("The library scan found no links on page %d.", page_number)
+                break
+            groups = choice_groups(links)
+            logger.debug("The library scan found %d link(s) on page %d, in Choice "
+                         "month(s): %s.", len(links), page_number,
+                         [group["slug"] for group in groups] or "none")
+            if groups:
+                return groups[0]
+        return None
+
+    async def _month_cards(self, group: dict) -> list:
+        """A month's games as the library's cards name them, read whole.
+
+        This is what the paged library walk remains for: a month worked
+        from its games' own pages needs every one of its cards, and one
+        month's games can straddle several of the library's pages. The
+        games the pick already carries stand when the walk names no such
+        month.
+        """
+        for walked in await self._library_groups(group["slug"]):
+            if walked["slug"] == group["slug"]:
+                return walked["games"]
+        return group.get("games") or []
+
+    async def _library_groups(self, current_slug: str | None = None) -> list:
+        """The Choice months the library's first pages name, newest first.
+
+        The pick no longer reads months this way - the current month is
+        settled by its showcase, and the newest owned month by a scan
+        that stops at the first month named. This whole-month read
+        remains for one job: gathering the cards of a month that is
+        worked from its games' own pages, where every card is needed
+        (see _month_cards).
+
+        The library lists a few games to a page, newest first, with no
+        bundle headings: a card's own bundle line is what names its
+        month, and one month's games can straddle several pages, pushed
+        down by anything bought after them. So the read walks pages -
+        the address the page's own pagination names - until the month
+        being looked for (the current month, or the newest month found
+        when no current month was read) has been read whole: a page
+        holding none of its games, after pages that did, ends the walk.
+        A page with no links at all ends it too, and a cap keeps a
+        library that never names the month from being walked forever.
+
+        What each read found is logged - how many links the page handed
+        back, and the months they grouped into - so a later empty or
+        partial read can be told apart from a library that genuinely
+        holds less.
+        """
+        links: list = []
+        target = current_slug
+        for page_number in range(1, 11):
+            url = URL_LIBRARY if page_number == 1 else f"{URL_LIBRARY}?page={page_number}"
+            await self.page.get(url)
+            await self.sleep(5)
+            page_links = await self._eval_json(LIBRARY_LINKS_JS, [])
+            page_links = page_links if isinstance(page_links, list) else []
+            if not page_links:
+                logger.debug("The library read found no links on page %d.", page_number)
+                break
+            links.extend(page_links)
+            groups = choice_groups(links)
+            logger.debug("The library read found %d link(s) on page %d, "
+                         "in Choice month(s): %s.", len(page_links), page_number,
+                         [group["slug"] for group in groups] or "none")
+            if target is None and groups:
+                target = groups[0]["slug"]
+            if target is None:
+                continue
+            if not any(group["slug"] == target for group in groups):
+                continue
+            page_slugs = {group["slug"] for group in choice_groups(page_links)}
+            if target not in page_slugs:
+                # The month's games ended on an earlier page; the ones
+                # already read are its whole showing here.
+                break
+        return choice_groups(links)
 
     # ------------------------------------------------------------------
     # Saving standings
@@ -837,18 +1052,21 @@ class HumbleClaimer(BaseClaimer):
             return None
         return row.status, row.code
 
-    async def _title_already_handled(self, title: str, game_id: str) -> bool:
-        """Whether this title was already settled under a different game id.
+    async def _key_already_recorded(self, code: str, game_id: str) -> bool:
+        """Whether this very key already stands in a sibling row.
 
-        A title can stand in the database under more than one game id: the
-        id scheme changed with the rebuilt site, so a month first read by
-        older code keeps its old rows beside the new ones. A sibling row
-        that holds a key, or that ended claimed and activated or notified,
-        means the title's key was already worked - activated, or posted as
-        a duplicate. Saving the key again under this game id would queue
-        it a second time and post it as a duplicate a second time.
+        A key is its string, not its title. A game can stand in the
+        database under more than one game id: the id scheme changed with
+        the rebuilt site, so a month first read by older code keeps its
+        old rows beside the new ones. When the identical string is
+        already recorded under another id, in any standing, this entry
+        adds nothing - the key was already queued, activated or posted
+        from that row, and saving it again under this game id would
+        queue it a second time and post it as a duplicate a second
+        time. A sibling holding a different string is a different key
+        for the same game, and settles nothing here.
         """
-        from sqlalchemy import or_, select
+        from sqlalchemy import select
 
         from src.core.database import ClaimedGame
 
@@ -857,12 +1075,8 @@ class HumbleClaimer(BaseClaimer):
                 select(ClaimedGame.id).where(
                     ClaimedGame.store == "humble",
                     ClaimedGame.user == (self.user or "unknown"),
-                    ClaimedGame.title == title,
                     ClaimedGame.game_id != game_id,
-                    or_(
-                        ClaimedGame.code.isnot(None),
-                        ClaimedGame.status.in_(("claimed and activated", "notified")),
-                    ),
+                    ClaimedGame.code == code,
                 ))
             return result.first() is not None
 
@@ -928,16 +1142,14 @@ class HumbleClaimer(BaseClaimer):
                 await self._remember(entry["game_id"], title, order_url, "existed",
                                      overwrite=False)
                 self.notify_games.append({"title": title, "url": order_url, "status": "existed"})
-            elif row is not None and await self._title_already_handled(title, entry["game_id"]):
-                # The title was already settled under a different game id -
-                # its key activated, or posted as a duplicate - so this
-                # codeless row is the "revealed outside the bot" standing
-                # after all, not the Padrino shape below: a run that first
-                # reads a month under new game ids records every entry
-                # without its key, and saving those keys on the next run
-                # would queue them all a second time. Record it without
-                # the key, the same as the no-row branch below.
-                logger.info("'%s' was already handled under another entry, so its key is "
+            elif row is not None and await self._key_already_recorded(code, entry["game_id"]):
+                # The identical key already stands recorded under a
+                # different game id - queued, activated, or posted as a
+                # duplicate from that row. This codeless row therefore
+                # adds nothing: saving the same string here would queue
+                # it a second time. A different string would be a
+                # different key and would fall through to the save below.
+                logger.info("The key for '%s' already stands under another entry, so it is "
                             "recorded without being queued again.", title)
                 await self._remember(entry["game_id"], title, order_url, "existed")
                 self.notify_games.append({"title": title, "url": order_url, "status": "existed"})
@@ -951,13 +1163,17 @@ class HumbleClaimer(BaseClaimer):
                                      key=code, platform=platform)
                 self.notify_games.append({"title": title, "url": order_url, "status": "claimed"})
             else:
-                # Revealed outside the bot - by you, on the site. It was
-                # never the bot's key to queue, so it is recorded without
-                # one, and the Steam queue never sees it.
-                logger.info("'%s' was revealed outside the bot, so it is recorded "
-                            "without its key and not queued.", title)
-                await self._remember(entry["game_id"], title, order_url, "existed")
-                self.notify_games.append({"title": title, "url": order_url, "status": "existed"})
+                # No row at all: the key has never been processed. A
+                # reveal outside the bot can still be unclaimed, so save
+                # it like a key the bot revealed itself and let its
+                # store's duplicate check decide whether it is a spare
+                # or an activation.
+                logger.info("✓ '%s' stood revealed with no record of it; its key (%s) is "
+                            "saved now and handed to its store for the duplicate check.",
+                            title, mask_code(code))
+                await self._remember(entry["game_id"], title, order_url, "claimed",
+                                     key=code, platform=platform)
+                self.notify_games.append({"title": title, "url": order_url, "status": "claimed"})
             return "settled"
 
         if state == "redeemed":
@@ -1083,21 +1299,30 @@ class HumbleClaimer(BaseClaimer):
         """Settle one Choice month: record what is settled, reveal what is waiting.
 
         The order page is the month's work list - it carries the DLC
-        entries the library's cards do not show. Only when it cannot be
-        reached does the run work from the games' own pages, and says so:
-        a month settled that way may miss an entry only the order page
-        lists.
+        entries the library's cards do not show. A pick that arrived
+        with its order page (the current month, through its showcase)
+        is read from there directly. A month with no order page to read
+        - an older month, whose order page the new library names no way
+        to reach - and a month whose order page cannot be read are
+        worked from the games' own pages, and say so: a month settled
+        that way may miss an entry only the order page lists.
         """
-        order_url = await self._order_url(group)
+        order_url = group.get("order_url")
         entries = []
         if order_url:
             entries = await self._order_entries(order_url)
         if not entries:
-            logger.warning("The month's order page could not be read, so its games are "
-                           "worked from their own pages; an entry only the order page "
-                           "lists (a DLC pack, say) is invisible this run.")
+            if order_url:
+                logger.warning("The month's order page could not be read, so its games are "
+                               "worked from their own pages; an entry only the order page "
+                               "lists (a DLC pack, say) is invisible this run.")
+            else:
+                logger.warning("'%s' is worked from its games' own pages, there being "
+                               "no order page to read for it; an entry only the order "
+                               "page lists (a DLC pack, say) is invisible this run.",
+                               month_display_name(group["slug"]))
             order_url = order_url or URL_LIBRARY
-            for game in group["games"]:
+            for game in await self._month_cards(group):
                 entries.append(await self._content_entry(game))
         if not entries:
             logger.warning("No entries could be read for '%s' at all.",
