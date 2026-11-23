@@ -10,6 +10,8 @@ import asyncio
 import json
 from datetime import date
 
+import pytest
+
 from src.stores.humble import (
     AUTH_FORM_JS,
     CONTENT_ENTRY_JS,
@@ -385,7 +387,7 @@ class TestOrderUrl:
 
 
 class TestRevealedKeyAlreadyHandled:
-    """A revealed key whose title was already settled under another game id is not queued again.
+    """A revealed key that already stands under another game id is not queued again.
 
     The November 2026 incident: the rebuilt site's new game ids meant the
     first run under them recorded every November entry as existed, without
@@ -394,8 +396,10 @@ class TestRevealedKeyAlreadyHandled:
     saved as claimed, so the Steam queue posted all ten November keys to
     the duplicates channel: the games were already activated, or already
     posted, and DYSMANTLE went up twice. The two standings contradict each
-    other across runs unless the Padrino save first checks whether a
-    sibling row already settled the title.
+    other across runs unless the Padrino save first checks whether the
+    key already stands under another id. Identity is the string, not the
+    title (Nathan's ruling): a sibling holding a different key settles
+    nothing - that key is a new key and is saved like any other.
     """
 
     ORDER_URL = "https://www.humblebundle.com/home/library/order-uuid"
@@ -438,24 +442,33 @@ class TestRevealedKeyAlreadyHandled:
 
         return asyncio.run(run())
 
-    def test_a_key_activated_under_another_id_is_not_saved_again(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("sibling_status", ["claimed and activated", "notified"])
+    def test_the_same_key_under_another_id_is_not_saved_again(self, tmp_path, monkeypatch, sibling_status):
+        # The November 2026 shape: the sibling row holds the IDENTICAL
+        # string - activated from it, or posted as a duplicate from it
+        # (the DYSMANTLE shape). The entry adds nothing.
         standing, notify, saved = self._settle(tmp_path, monkeypatch, [
             self._row(self.GAME_ID, "existed"),
-            self._row(self.OLD_GAME_ID, "claimed and activated", code="ZZZZZ-99999-YYYYY"),
+            self._row(self.OLD_GAME_ID, sibling_status, code=self.KEY),
         ])
         assert standing == "settled"
         assert saved[self.GAME_ID].status == "existed" and saved[self.GAME_ID].code is None
         assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "existed"}]
 
-    def test_a_key_posted_as_a_duplicate_is_not_saved_again(self, tmp_path, monkeypatch):
-        # The DYSMANTLE shape: the sibling row is the duplicate posting itself.
+    @pytest.mark.parametrize("sibling_status", ["claimed and activated", "notified"])
+    def test_a_different_key_under_another_id_is_saved_and_queued(self, tmp_path, monkeypatch, sibling_status):
+        # Nathan's ruling: the sibling settled a DIFFERENT string for the
+        # same game, so this key is a new key - the Padrino save runs and
+        # it queues like any other, to be posted as a duplicate in its
+        # own right if the game is owned.
         standing, notify, saved = self._settle(tmp_path, monkeypatch, [
             self._row(self.GAME_ID, "existed"),
-            self._row(self.OLD_GAME_ID, "notified", code="ZZZZZ-99999-YYYYY"),
+            self._row(self.OLD_GAME_ID, sibling_status, code="ZZZZZ-99999-YYYYY"),
         ])
         assert standing == "settled"
-        assert saved[self.GAME_ID].status == "existed" and saved[self.GAME_ID].code is None
-        assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "existed"}]
+        assert saved[self.GAME_ID].status == "claimed" and saved[self.GAME_ID].code == self.KEY
+        assert json.loads(saved[self.GAME_ID].extra)["external_store"] == "steam"
+        assert notify == [{"title": self.TITLE, "url": self.ORDER_URL, "status": "claimed"}]
 
     def test_a_key_with_no_sibling_is_saved_and_queued(self, tmp_path, monkeypatch):
         # The Padrino shape, unchanged: the reveal was recorded without the

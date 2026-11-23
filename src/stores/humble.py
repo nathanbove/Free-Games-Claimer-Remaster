@@ -40,10 +40,12 @@ browser:
      revealed outside the bot, by you on the site, was never the bot's to
      queue. A row the bot made earlier without the key in it (the reveal
      was recorded, the key itself was not) does get the key saved, so the
-     key takes its place in the queue like any other - unless the title
-     was already settled under a different game id (its key activated, or
-     posted as a duplicate), in which case the key is recorded without
-     being queued a second time. An unrevealed key is
+     key takes its place in the queue like any other - unless the same
+     key already stands recorded under a different game id (queued,
+     activated, or posted as a duplicate from that row), in which case
+     the key is recorded without being queued a second time. A key is
+     its string: a different key for the same game is a new key, and
+     takes its place in the queue the same way. An unrevealed key is
      revealed by pressing its Reveal button and reading the key the page
      shows afterwards; a keyless grant is recorded as claimed with no key.
 
@@ -837,18 +839,21 @@ class HumbleClaimer(BaseClaimer):
             return None
         return row.status, row.code
 
-    async def _title_already_handled(self, title: str, game_id: str) -> bool:
-        """Whether this title was already settled under a different game id.
+    async def _key_already_recorded(self, code: str, game_id: str) -> bool:
+        """Whether this very key already stands in a sibling row.
 
-        A title can stand in the database under more than one game id: the
-        id scheme changed with the rebuilt site, so a month first read by
-        older code keeps its old rows beside the new ones. A sibling row
-        that holds a key, or that ended claimed and activated or notified,
-        means the title's key was already worked - activated, or posted as
-        a duplicate. Saving the key again under this game id would queue
-        it a second time and post it as a duplicate a second time.
+        A key is its string, not its title. A game can stand in the
+        database under more than one game id: the id scheme changed with
+        the rebuilt site, so a month first read by older code keeps its
+        old rows beside the new ones. When the identical string is
+        already recorded under another id, in any standing, this entry
+        adds nothing - the key was already queued, activated or posted
+        from that row, and saving it again under this game id would
+        queue it a second time and post it as a duplicate a second
+        time. A sibling holding a different string is a different key
+        for the same game, and settles nothing here.
         """
-        from sqlalchemy import or_, select
+        from sqlalchemy import select
 
         from src.core.database import ClaimedGame
 
@@ -857,12 +862,8 @@ class HumbleClaimer(BaseClaimer):
                 select(ClaimedGame.id).where(
                     ClaimedGame.store == "humble",
                     ClaimedGame.user == (self.user or "unknown"),
-                    ClaimedGame.title == title,
                     ClaimedGame.game_id != game_id,
-                    or_(
-                        ClaimedGame.code.isnot(None),
-                        ClaimedGame.status.in_(("claimed and activated", "notified")),
-                    ),
+                    ClaimedGame.code == code,
                 ))
             return result.first() is not None
 
@@ -928,16 +929,19 @@ class HumbleClaimer(BaseClaimer):
                 await self._remember(entry["game_id"], title, order_url, "existed",
                                      overwrite=False)
                 self.notify_games.append({"title": title, "url": order_url, "status": "existed"})
-            elif row is not None and await self._title_already_handled(title, entry["game_id"]):
-                # The title was already settled under a different game id -
-                # its key activated, or posted as a duplicate - so this
-                # codeless row is the "revealed outside the bot" standing
-                # after all, not the Padrino shape below: a run that first
-                # reads a month under new game ids records every entry
-                # without its key, and saving those keys on the next run
-                # would queue them all a second time. Record it without
-                # the key, the same as the no-row branch below.
-                logger.info("'%s' was already handled under another entry, so its key is "
+            elif row is not None and await self._key_already_recorded(code, entry["game_id"]):
+                # The identical key already stands under a different game
+                # id - queued, activated, or posted as a duplicate from
+                # that row - so this codeless row is the "revealed outside
+                # the bot" standing after all, not the Padrino shape
+                # below: a run that first reads a month under new game
+                # ids records every entry without its key, and saving
+                # those same strings on the next run would queue them
+                # all a second time. A different string would be a
+                # different key and would fall through to the save below.
+                # Record it without the key, the same as the no-row
+                # branch below.
+                logger.info("The key for '%s' already stands under another entry, so it is "
                             "recorded without being queued again.", title)
                 await self._remember(entry["game_id"], title, order_url, "existed")
                 self.notify_games.append({"title": title, "url": order_url, "status": "existed"})
